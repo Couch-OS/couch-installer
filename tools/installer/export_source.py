@@ -35,7 +35,15 @@ REPOSITORY_TEMPLATES = {
 }
 REPOSITORY_WORKFLOWS = (
     '.github/workflows/installer-binaries.yml',
+    # Reusable checks that installer-binaries.yml calls and admission requires.
+    '.github/workflows/installer-native-frontend.yml',
+    '.github/workflows/installer-native-dependencies.yml',
+    '.github/workflows/installer-host-dependencies.yml',
+    '.github/workflows/installer-mtk-runtime.yml',
+    '.github/workflows/installer-launchers.yml',
+    '.github/workflows/installer-native-host.yml',
     '.github/workflows/installer-windows-launcher-acceptance.yml',
+    '.github/workflows/firmware-watch.yml',
 )
 
 

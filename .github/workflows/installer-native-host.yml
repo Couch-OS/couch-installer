@@ -1,0 +1,107 @@
+name: Native installer host
+# Reusable: installer-binaries.yml calls this for every change and its
+# admission job requires it. Dispatch it directly to rerun it alone or to
+# exercise native extraction of the pinned public official OTA.
+on:
+  workflow_call:
+    inputs:
+      verify_official_ota:
+        description: Download the pinned public official OTA and exercise native extraction
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      verify_official_ota:
+        description: Download the pinned public official OTA and exercise native extraction
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # Cache the dependency build: couch-installer-host pulls reqwest, rustls,
+      # ring and zip, and four workflows rebuilt all of it on every runner.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/installer/host
+      - name: Check native host
+        working-directory: tools/installer/host
+        run: |
+          cargo fmt --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo build --release --locked
+      - name: Check embedded worker and actual native entrypoint without devices
+        shell: python
+        run: |
+          import os, pathlib, subprocess
+          suffix = '.exe' if os.name == 'nt' else ''
+          os.environ['COUCH_NATIVE_HOST_TEST'] = str((pathlib.Path('tools/installer/host/target/release') / ('couch-installer-host' + suffix)).resolve())
+          # Discovery rather than a hand-kept pattern list on Linux and macOS:
+          # the list ran 11 of the 43 test files, leaving the partition write
+          # path, the USB and TTY transports, the TUI, factory restore and
+          # bootstrap untested on every platform. The whole suite is ~400
+          # tests in about 7 seconds. Windows keeps the curated list: most of
+          # the rest exercise POSIX-only paths (temp-file permission bits,
+          # ptys, monotonic clock intervals) and fail there for that reason,
+          # not because the installer misbehaves on Windows.
+          if os.name == 'nt':
+              for pattern in ('test_mtk_adapter.py', 'test_mtk_capture_evidence.py', 'test_mtk_com.py', 'test_stage_usb.py', 'test_couch_serial.py', 'test_native_entrypoint.py', 'test_wifi_debug*.py', 'test_release_discovery.py'):
+                  subprocess.run(['python', '-m', 'unittest', 'discover', '-s', 'tools/installer', '-p', pattern], check=True, timeout=120)
+          else:
+              subprocess.run(['python', '-m', 'unittest', 'discover', '-s', 'tools/installer', '-p', 'test_*.py'], check=True, timeout=600)
+      - name: Execute native official input preparation
+        if: inputs.verify_official_ota
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess, urllib.request
+          pin = json.loads(pathlib.Path('tools/installer/pins/ha100_official_runtime.json').read_text())
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'couch-official-input-check'
+          root.mkdir()
+          archive = root / 'official.zip'
+          digest, count = hashlib.sha256(), 0
+          request = urllib.request.Request(pin['url'], headers={'User-Agent': 'couch-native-input-validation'})
+          with urllib.request.urlopen(request, timeout=30) as response, archive.open('xb') as target:
+              while block := response.read(1024 * 1024):
+                  count += len(block)
+                  if count > pin['size']:
+                      raise RuntimeError('Official download exceeds pinned size')
+                  digest.update(block)
+                  target.write(block)
+          assert count == pin['size'] and digest.hexdigest() == pin['sha256'], 'Official archive pin mismatch'
+          suffix = '.exe' if os.name == 'nt' else ''
+          executable = pathlib.Path('tools/installer/host/target/release') / ('couch-installer-host' + suffix)
+          subprocess.run([str(executable.resolve()), 'prepare-official', str(archive), str(root / 'inputs')], check=True, timeout=600)
+          result = json.loads((root / 'inputs/vendor/vendor-provenance.json').read_text())
+          assert len(result['files']) == 33 and result['installable'] is False
+          print('Native owner-side extraction verified: 33 files; no device access.')
+          # No OTA, vendor input, private directory or output is uploaded.
+
+  stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/installer/linux_stage/probe
+      - name: Install regular-image fixture tools
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+      - name: Check private stage
+        run: |
+          cargo fmt --manifest-path tools/installer/linux_stage/probe/Cargo.toml --check
+          cargo test --locked --manifest-path tools/installer/linux_stage/probe/Cargo.toml --features private-install

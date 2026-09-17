@@ -1,10 +1,10 @@
 name: Build installer binaries
 on:
+  # This repository is only the installer, so every change builds. Branch
+  # protection requires the final admission job.
   push:
-    branches: [main]
-    paths: ['tools/installer/**', '.github/workflows/installer-binaries.yml']
+    branches: [dev, main]
   pull_request:
-    paths: ['tools/installer/**', '.github/workflows/installer-binaries.yml']
   workflow_dispatch:
 concurrency:
   group: installer-binaries-${{ github.event.pull_request.number || github.ref }}
@@ -152,3 +152,17 @@ jobs:
           name: couch-installer-host-macos-universal
           path: universal/couch-installer-host
           if-no-files-found: error
+  admission:
+    if: always()
+    needs: [isolated-source, native, macos-universal]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every installer build and test job
+        env:
+          ISOLATED: ${{ needs.isolated-source.result }}
+          NATIVE: ${{ needs.native.result }}
+          UNIVERSAL: ${{ needs.macos-universal.result }}
+        run: |
+          test "$ISOLATED" = success
+          test "$NATIVE" = success
+          test "$UNIVERSAL" = success

@@ -60,7 +60,7 @@ layout; the init script still mounts no device partitions. Original backups,
 image writes, close/fsync and full direct readback are enforced before final
 boot. The host includes the entered network in a privately customized OS image,
 so that network intentionally persists in the newly installed Couch system.
-See [private flow](../../../docs/installer-linux-usb-stage.md) and the
+See [private flow](https://github.com/dangerouslaser/couch/blob/dev/docs/installer-linux-usb-stage.md) and the
 [protocol extension](../linux_stage/PROTOCOL.md).
 
 The host checks radio readiness before requesting an SSID or password. The

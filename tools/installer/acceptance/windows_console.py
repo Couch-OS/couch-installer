@@ -10,6 +10,10 @@ import sys
 import threading
 import time
 
+# More Down presses than the first menu can hold. The choice list clamps the
+# selection at its last entry, which is always Cancel.
+DOWN_PRESSES = 16
+
 
 def run(launcher, output):
     kernel = C.WinDLL('kernel32', use_last_error=True)
@@ -81,7 +85,11 @@ def run(launcher, output):
             visible = re.sub(rb'\s+', b' ', re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b' ', bytes(transcript)))
             if not sent and b'Reinstall existing Couch' in visible and b'Cancel' in visible:
                 time.sleep(0.2)
-                for key in (b'\x1b[B', b'\x1b[B', b'\x1b[B', b'\r'):
+                # Cancel is the menu's last option and Down saturates there, so
+                # pressing it past the menu's length selects Cancel however many
+                # install modes the first menu carries. A fixed three presses
+                # selected whatever happened to be fourth.
+                for key in (b'\x1b[B',) * DOWN_PRESSES + (b'\r',):
                     count = W.DWORD(); checked(write(writer, key, len(key), C.byref(count), None))
                     if count.value != len(key): raise RuntimeError('Short console input')
                     time.sleep(0.1)

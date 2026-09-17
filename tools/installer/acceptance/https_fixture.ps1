@@ -7,7 +7,11 @@ $requests = @()
 try {
     $config = Get-Content -Raw (Join-Path $Assets 'installer.json') | ConvertFrom-Json
     if ($config.schema -eq 1) {
-        $releasePath = '/dangerouslaser/couch/releases/download/' + $config.version
+        # Schema-1 installers share the OS payload's release repository: Couch
+        # under its current or transferred name, never another owner.
+        $repository = ([Uri]$config.payload.url).AbsolutePath -replace '^(/[^/]+/[^/]+)/releases/download/.*$', '$1'
+        if ($repository -cnotin @('/dangerouslaser/couch', '/Couch-OS/couch')) { throw 'Unsupported fixture OS repository' }
+        $releasePath = $repository + '/releases/download/' + $config.version
     } elseif ($config.schema -eq 2) {
         $releasePath = ([Uri]$config.installer.release_url).AbsolutePath
     } else {

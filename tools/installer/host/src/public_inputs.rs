@@ -68,6 +68,17 @@ struct IndependentRelease {
 // Protocol 1 is the existing six-file HA100 payload and RAM installation
 // transaction. Bumping installer versions alone does not change that ABI.
 const INSTALLATION_PROTOCOL: u32 = 1;
+// The Couch repository publishes OS payloads and the historical installer
+// releases. It moves from dangerouslaser/couch to Couch-OS/couch: published
+// descriptors keep the old name (GitHub redirects it) and new releases carry
+// the new one, so exactly these two spellings are admitted.
+const COUCH_REPOSITORIES: [&str; 2] = ["dangerouslaser/couch", "Couch-OS/couch"];
+// New installer releases are published from their own repository.
+const INSTALLER_REPOSITORIES: [&str; 3] = [
+    COUCH_REPOSITORIES[0],
+    COUCH_REPOSITORIES[1],
+    "Couch-OS/couch-installer",
+];
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
@@ -188,15 +199,13 @@ pub fn release(path: &Path) -> Result<Release> {
             // Installer releases may move repositories independently of OS payloads.
             // Compare complete URLs so alternate domains, refs and extra paths fail.
             ensure!(
-                ["dangerouslaser/couch", "dangerouslaser/couch-installer"]
-                    .iter()
-                    .any(|repository| {
-                        independent.installer.release_url
-                            == format!(
-                                "https://github.com/{repository}/releases/download/installer-{}",
-                                independent.installer.version
-                            )
-                    }),
+                INSTALLER_REPOSITORIES.iter().any(|repository| {
+                    independent.installer.release_url
+                        == format!(
+                            "https://github.com/{repository}/releases/download/installer-{}",
+                            independent.installer.version
+                        )
+                }),
                 "installer release URL differs from reviewed repository or version"
             );
             Release {
@@ -231,15 +240,15 @@ pub fn release(path: &Path) -> Result<Release> {
     // New descriptors use only exact OS release URLs. Preserve schema-1 admission
     // for already published descriptors; downloaded bytes remain size/hash pinned.
     if schema == Some(2) {
-        let prefix = format!(
-            "https://github.com/dangerouslaser/couch/releases/download/{}/",
-            result.os.version
-        );
-        let name = result
-            .payload
-            .url
-            .strip_prefix(&prefix)
-            .context("OS payload URL differs from version")?;
+        let name = COUCH_REPOSITORIES
+            .iter()
+            .find_map(|repository| {
+                result.payload.url.strip_prefix(&format!(
+                    "https://github.com/{repository}/releases/download/{}/",
+                    result.os.version
+                ))
+            })
+            .context("OS payload URL differs from Couch repository or version")?;
         ensure!(
             !name.is_empty()
                 && name
@@ -277,6 +286,10 @@ fn download(
         "unsupported artifact URL"
     );
     let allow_http = official;
+    // Bytes are authenticated by the size/hash pin, not the serving host. GitHub
+    // answers a transferred repository's release URL with two redirects
+    // (dangerouslaser/couch -> Couch-OS/couch -> release-assets), so any HTTPS
+    // hop is followed within the bound.
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(1800))
@@ -603,19 +616,24 @@ mod tests {
         let (root, fixture_release, _) = fixture(None, false);
         let path = root.path().join("installer.json");
         let mut value = descriptor(&fixture_release.payload);
-        for repository in ["dangerouslaser/couch", "dangerouslaser/couch-installer"] {
+        for repository in [
+            "dangerouslaser/couch",
+            "Couch-OS/couch",
+            "Couch-OS/couch-installer",
+        ] {
             value["installer"]["release_url"] = json!(format!(
                 "https://github.com/{repository}/releases/download/installer-v1.2.3"
             ));
             fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
             assert!(release(&path).is_ok());
         }
-        let base =
-            "https://github.com/dangerouslaser/couch-installer/releases/download/installer-v1.2.3";
+        let base = "https://github.com/Couch-OS/couch-installer/releases/download/installer-v1.2.3";
         for invalid in [
             base.replace("github.com", "example.com"),
             base.replace("https:", "http:"),
-            base.replace("dangerouslaser/", "other/"),
+            base.replace("Couch-OS/", "other/"),
+            base.replace("Couch-OS/", "dangerouslaser/"),
+            base.replace("Couch-OS/", "couch-os/"),
             base.replace("couch-installer", "other"),
             base.replace("installer-v1.2.3", "latest"),
             base.replace("installer-v1.2.3", "installer-v1.2.4"),
@@ -629,9 +647,73 @@ mod tests {
             assert!(release(&path).is_err());
         }
         value["installer"]["release_url"] = json!(base);
-        value["payload"]["url"] = json!("https://github.com/dangerouslaser/couch-installer/releases/download/v0.1.0/payload.tar.gz");
+        value["payload"]["url"] = json!(
+            "https://github.com/Couch-OS/couch-installer/releases/download/v0.1.0/payload.tar.gz"
+        );
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(release(&path).is_err());
+    }
+    #[test]
+    fn couch_repository_transfer_admits_exactly_both_names() {
+        let (root, fixture_release, _) = fixture(None, false);
+        let path = root.path().join("installer.json");
+        let mut value = descriptor(&fixture_release.payload);
+        let admitted = |value: &serde_json::Value| {
+            fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            release(&path).is_ok()
+        };
+        // Either Couch name serves the OS payload, paired with any installer
+        // repository: published descriptors are not rewritten by the transfer.
+        for os in ["dangerouslaser/couch", "Couch-OS/couch"] {
+            for installer in [
+                "dangerouslaser/couch",
+                "Couch-OS/couch",
+                "Couch-OS/couch-installer",
+            ] {
+                value["installer"]["release_url"] = json!(format!(
+                    "https://github.com/{installer}/releases/download/installer-v1.2.3"
+                ));
+                value["payload"]["url"] = json!(format!(
+                    "https://github.com/{os}/releases/download/v0.1.0/payload.tar.gz"
+                ));
+                assert!(admitted(&value), "{os} payload, {installer} installer");
+            }
+        }
+        let os = "https://github.com/Couch-OS/couch/releases/download/v0.1.0/payload.tar.gz";
+        let installer = "https://github.com/Couch-OS/couch/releases/download/installer-v1.2.3";
+        let lookalikes = [
+            "couch-os/couch",
+            "Couch-OS/Couch",
+            "Couch-OS/couch-os",
+            "Couch-OS/other",
+            "other/couch",
+            "Dangerouslaser/couch",
+            "dangerouslaser/couch-installer",
+            "dangerouslaser/Couch-OS/couch",
+            "Couch-OS/couch.git",
+        ];
+        for repository in lookalikes {
+            value["installer"]["release_url"] = json!(installer);
+            value["payload"]["url"] = json!(os.replace("Couch-OS/couch", repository));
+            assert!(!admitted(&value), "{repository} payload");
+            value["payload"]["url"] = json!(os);
+            value["installer"]["release_url"] =
+                json!(installer.replace("Couch-OS/couch", repository));
+            assert!(!admitted(&value), "{repository} installer");
+        }
+        value["installer"]["release_url"] = json!(installer);
+        for invalid in [
+            os.replace("github.com", "api.github.com"),
+            os.replace("github.com", "github.com.example.com"),
+            os.replace("https:", "http:"),
+            os.replace("v0.1.0/", "v0.2.0/"),
+            os.replace("/releases/download/", "/raw/main/"),
+            os.replace("payload.tar.gz", "nested/payload.tar.gz"),
+            format!("{os}?ref=latest"),
+        ] {
+            value["payload"]["url"] = json!(invalid);
+            assert!(!admitted(&value), "{invalid}");
+        }
     }
     #[test]
     fn schema_one_preserves_shared_identity_and_implicit_protocol() {

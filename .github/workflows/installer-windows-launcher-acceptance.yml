@@ -11,13 +11,14 @@ on:
   workflow_dispatch:
     inputs:
       installer_repository:
-        description: Independently reviewed installer source and binary repository
+        description: Independently reviewed installer source and binary repository (Couch-OS/couch is Couch after its transfer)
         type: choice
         required: true
         default: dangerouslaser/couch
         options:
           - dangerouslaser/couch
-          - dangerouslaser/couch-installer
+          - Couch-OS/couch
+          - Couch-OS/couch-installer
       source_commit:
         description: Independently recorded host source SHA (must match run, receipts and generator)
         required: true

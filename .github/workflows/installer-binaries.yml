@@ -152,9 +152,32 @@ jobs:
           name: couch-installer-host-macos-universal
           path: universal/couch-installer-host
           if-no-files-found: error
+  # Cross-platform installer checks, one reusable workflow each. Every change
+  # runs all of them so the single required admission check covers them.
+  native-frontend:
+    uses: ./.github/workflows/installer-native-frontend.yml
+  native-dependencies:
+    uses: ./.github/workflows/installer-native-dependencies.yml
+  host-dependencies:
+    uses: ./.github/workflows/installer-host-dependencies.yml
+  mtk-runtime:
+    uses: ./.github/workflows/installer-mtk-runtime.yml
+  launchers:
+    uses: ./.github/workflows/installer-launchers.yml
+  native-host:
+    uses: ./.github/workflows/installer-native-host.yml
   admission:
     if: always()
-    needs: [isolated-source, native, macos-universal]
+    needs:
+      - isolated-source
+      - native
+      - macos-universal
+      - native-frontend
+      - native-dependencies
+      - host-dependencies
+      - mtk-runtime
+      - launchers
+      - native-host
     runs-on: ubuntu-24.04
     steps:
       - name: Require every installer build and test job
@@ -162,7 +185,18 @@ jobs:
           ISOLATED: ${{ needs.isolated-source.result }}
           NATIVE: ${{ needs.native.result }}
           UNIVERSAL: ${{ needs.macos-universal.result }}
+          NATIVE_FRONTEND: ${{ needs.native-frontend.result }}
+          NATIVE_DEPENDENCIES: ${{ needs.native-dependencies.result }}
+          HOST_DEPENDENCIES: ${{ needs.host-dependencies.result }}
+          MTK_RUNTIME: ${{ needs.mtk-runtime.result }}
+          LAUNCHERS: ${{ needs.launchers.result }}
+          NATIVE_HOST: ${{ needs.native-host.result }}
         run: |
-          test "$ISOLATED" = success
-          test "$NATIVE" = success
-          test "$UNIVERSAL" = success
+          status=0
+          for check in ISOLATED NATIVE UNIVERSAL NATIVE_FRONTEND NATIVE_DEPENDENCIES \
+                       HOST_DEPENDENCIES MTK_RUNTIME LAUNCHERS NATIVE_HOST; do
+            result=${!check}
+            echo "$check: $result"
+            test "$result" = success || status=1
+          done
+          exit "$status"

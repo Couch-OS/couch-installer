@@ -31,10 +31,19 @@ PRIVATE_SUFFIXES = frozenset({".key", ".pem", ".p12", ".pfx", ".kdbx"})
 REPOSITORY_TEMPLATES = {
     'tools/installer/repository/README.md': 'README.md',
     'tools/installer/repository/gitignore': '.gitignore',
+    'tools/installer/repository/gitattributes': '.gitattributes',
 }
 REPOSITORY_WORKFLOWS = (
     '.github/workflows/installer-binaries.yml',
+    # Reusable checks that installer-binaries.yml calls and admission requires.
+    '.github/workflows/installer-native-frontend.yml',
+    '.github/workflows/installer-native-dependencies.yml',
+    '.github/workflows/installer-host-dependencies.yml',
+    '.github/workflows/installer-mtk-runtime.yml',
+    '.github/workflows/installer-launchers.yml',
+    '.github/workflows/installer-native-host.yml',
     '.github/workflows/installer-windows-launcher-acceptance.yml',
+    '.github/workflows/firmware-watch.yml',
 )
 
 
@@ -191,7 +200,7 @@ def main():
     parser.add_argument("source_root", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument('--repository', action='store_true',
-                        help='include standalone README, ignore rules and installer CI workflows')
+                        help='include standalone README, ignore and line-ending rules, and installer CI workflows')
     parser.add_argument(
         "--include-new-source",
         action="store_true",

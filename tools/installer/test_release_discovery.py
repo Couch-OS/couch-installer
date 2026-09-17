@@ -4,6 +4,7 @@ import io
 import json
 import unittest
 from unittest.mock import patch
+from urllib.request import Request
 
 import couch_tui
 from couch_install import InstallError
@@ -13,6 +14,11 @@ import release_discovery as discovery
 # cut after it, and the release they lead to.
 ALPHA = 'v0.1.0-alpha.20260913.148'
 DEV = 'v0.1.0-alpha.20260913.148.dev'
+OLD = 'https://github.com/dangerouslaser/couch/releases/download/'
+NEW = 'https://github.com/Couch-OS/couch/releases/download/'
+# Names that must never pass for Couch, before or after the transfer.
+LOOKALIKES = ('couch-os/couch', 'Couch-OS/Couch', 'Couch-OS/couch-installer', 'Couch-OS/other',
+              'dangerouslaser/couch-installer', 'Dangerouslaser/couch', 'other/couch', 'Couch-OS/couch.git')
 
 
 def fixture(tag=ALPHA):
@@ -96,6 +102,84 @@ class DiscoveryTests(unittest.TestCase):
             with self.assertRaises(InstallError): discovery.selections([bad], 'alpha')
         release['assets'] *= 2
         with self.assertRaises(InstallError): discovery.selections([release], 'alpha')
+
+    def test_asset_urls_accept_either_couch_name_and_no_other_owner(self):
+        release, data = fixture()
+        name = release['assets'][0]['name']
+        self.assertEqual(release['assets'][0]['browser_download_url'], OLD + ALPHA + '/' + name)
+        # After the transfer the API reports the new owner for every release.
+        for prefix, repository in ((OLD, 'dangerouslaser/couch'), (NEW, 'Couch-OS/couch')):
+            release['assets'][0]['browser_download_url'] = prefix + ALPHA + '/' + name
+            selected = discovery.selections([release], 'alpha')[0]
+            self.assertEqual(selected.url, prefix + ALPHA + '/' + name)
+            self.assertEqual(selected.record()['repository'], repository)
+            self.assertEqual(discovery.inspect_manifest(selected, fetch=lambda *_: data)['version'], ALPHA)
+        for url in [NEW.replace('Couch-OS/couch', repository) + ALPHA + '/' + name for repository in LOOKALIKES] + [
+                NEW + DEV + '/' + name, NEW + ALPHA + '/other.json', NEW.replace('https:', 'http:') + ALPHA + '/' + name]:
+            with self.subTest(url=url):
+                release['assets'][0]['browser_download_url'] = url
+                with self.assertRaises(InstallError): discovery.selections([release], 'alpha')
+
+    def test_manifest_file_urls_accept_either_couch_name_and_no_other_owner(self):
+        release, data = fixture()
+        release['assets'][0]['browser_download_url'] = NEW + ALPHA + '/' + release['assets'][0]['name']
+        name = f'couch-installer-{ALPHA}-linux-x86_64.tar.gz'
+        def inspect(url):
+            metadata = json.loads(data)
+            metadata['files'] = [{'name': name, 'size': 1024, 'sha256': 'a' * 64, 'url': url}]
+            encoded = json.dumps(metadata).encode()
+            release['assets'][0].update(size=len(encoded), digest='sha256:' + hashlib.sha256(encoded).hexdigest())
+            return discovery.inspect_manifest(discovery.selections([release], 'alpha')[0], fetch=lambda *_: encoded)
+        # A manifest published before the transfer still names the old owner.
+        for prefix in (OLD, NEW):
+            self.assertEqual(inspect(prefix + ALPHA + '/' + name)['files'][0]['name'], name)
+        for repository in LOOKALIKES:
+            with self.subTest(repository=repository), self.assertRaisesRegex(InstallError, 'file URL'):
+                inspect(NEW.replace('Couch-OS/couch', repository) + ALPHA + '/' + name)
+
+    def test_redirects_follow_the_transfer_to_release_assets_only(self):
+        handler = discovery.MetadataRedirects()
+        def follows(source, target):
+            try:
+                return handler.redirect_request(Request(source), None, 301, 'Moved', {}, target).full_url == target
+            except InstallError:
+                return False
+        asset = ALPHA + '/couch-' + ALPHA + '-sanytron-ha100.json'
+        storage = 'https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sig=x'
+        listing = '?per_page=100&page=2'
+        self.assertEqual(discovery.API, 'https://api.github.com/repos/dangerouslaser/couch/releases')
+        for source, target in ((OLD + asset, NEW + asset), (NEW + asset, storage), (OLD + asset, storage),
+                               (discovery.API + listing,
+                                'https://api.github.com/repositories/1363054496/releases' + listing)):
+            with self.subTest(source=source, target=target):
+                self.assertTrue(follows(source, target))
+        refused = [(OLD + asset, NEW.replace('Couch-OS/couch', repository) + asset) for repository in LOOKALIKES]
+        refused += [(OLD + asset, NEW + DEV + '/couch-' + DEV + '-sanytron-ha100.json'),
+                    (OLD + asset, OLD + asset), (OLD + asset, NEW.replace('https:', 'http:') + asset),
+                    (OLD + asset, storage.replace('https:', 'http:')), (OLD + asset, 'https://example.com/' + asset),
+                    ('https://github.com/other/couch/releases/download/' + asset, NEW + asset),
+                    ('https://github.com/other/couch/releases/download/' + asset, storage),
+                    (storage, NEW + asset),
+                    (discovery.API + listing, 'https://api.github.com/repositories/1/releases' + listing),
+                    (discovery.API + listing, 'https://api.github.com/repositories/1363054496/releases?per_page=100&page=1'),
+                    (discovery.API + listing, 'https://api.github.com/repos/Couch-OS/couch/releases' + listing),
+                    (discovery.API + listing, NEW + asset)]
+        for source, target in refused:
+            with self.subTest(source=source, target=target):
+                self.assertFalse(follows(source, target))
+
+    def test_metadata_origins_are_the_couch_api_or_either_couch_download_name(self):
+        asset = ALPHA + '/couch-' + ALPHA + '-sanytron-ha100.json'
+        with patch.object(discovery, 'build_opener') as opener:
+            for url in [NEW.replace('Couch-OS/couch', repository) + asset for repository in LOOKALIKES] + [
+                    'https://api.github.com/repos/Couch-OS/couch/releases?page=1',
+                    'https://api.github.com/repositories/1363054496/releases?page=1']:
+                with self.subTest(url=url), self.assertRaisesRegex(InstallError, 'origin'):
+                    discovery.fetch_bytes(url, 1)
+            opener.assert_not_called()
+            opener.return_value.open.return_value.__enter__.return_value.read.return_value = b'{}'
+            for url in (OLD + asset, NEW + asset, discovery.API + '?page=1'):
+                self.assertEqual(discovery.fetch_bytes(url, 2), b'{}')
 
     def test_selection_is_frozen_and_changed_manifest_rejected(self):
         release, data = fixture()

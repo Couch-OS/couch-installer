@@ -119,7 +119,7 @@ Android ID or serial is never substituted for the vendor Device ID. Free space
 for the selected backups is checked before bootstrap. No preloader or LK write
 operation exists in the worker.
 
-Reinstallation imports a [saved enrollment](../../../docs/installer-saved-enrollment.md)
+Reinstallation imports a [saved enrollment](https://github.com/dangerouslaser/couch/blob/dev/docs/installer-saved-enrollment.md)
 into a new private session. The selected Couch USB port is queried using a
 nonce-framed fixed CID command; only a matching retained CID permits one fixed
 USB reboot. An unavailable serial interface offers manual restart, while a CID

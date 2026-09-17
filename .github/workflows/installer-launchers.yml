@@ -1,0 +1,28 @@
+name: Native installer launchers
+# Reusable: installer-binaries.yml calls this for every change and its
+# admission job requires it. Dispatch it directly to rerun it alone.
+on:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify launcher generation and native dispatch
+        # bash stops at the first failing command on every runner; Windows
+        # PowerShell would only report the last command's exit status.
+        shell: bash
+        run: |
+          python -m unittest discover -s tools/installer -p test_installer_launchers.py -v
+          python tools/installer/test_release_descriptor.py

@@ -87,16 +87,32 @@ class AdmissionTests(unittest.TestCase):
                                      ['gh', 'api', f'repos/{repository}/actions/runs/123'])
             self.assertNotEqual(prepare.SOURCE, prepare.PAYLOAD_SOURCE)
             invoke(root/'accepted')
-            invoke(root/'separate', repository='dangerouslaser/couch-installer',
-                   config_repository='dangerouslaser/couch-installer')
+            invoke(root/'separate', repository='Couch-OS/couch-installer',
+                   config_repository='Couch-OS/couch-installer')
             separate = json.loads((root/'separate/admission.json').read_text())
-            self.assertEqual(separate['installer_repository'], 'dangerouslaser/couch-installer')
+            self.assertEqual(separate['installer_repository'], 'Couch-OS/couch-installer')
+            # Couch moves to Couch-OS/couch. A run selected under either name
+            # admits a descriptor published under either name, and only those.
+            for run_repository in ('dangerouslaser/couch', 'Couch-OS/couch'):
+                for published in ('dangerouslaser/couch', 'Couch-OS/couch'):
+                    name = f'transfer-{run_repository}-{published}'.replace('/', '-')
+                    invoke(root/name, repository=run_repository, config_repository=published)
+                    self.assertEqual(json.loads((root/name/'admission.json').read_text())['installer_repository'],
+                                     run_repository)
             admission = json.loads((root/'accepted/admission.json').read_text())
             self.assertEqual(admission['installer'], {'version': prepare.INSTALLER_VERSION, 'source_commit': prepare.SOURCE})
             self.assertEqual(admission['os'], {'version': prepare.OS_VERSION, 'source_commit': prepare.PAYLOAD_SOURCE, 'installation_protocol': 1})
             for name, kwargs, message in (
-                ('repository', {'config_repository': 'dangerouslaser/couch-installer'}, 'descriptor installer/OS identity'),
-                ('wrong-input-repository', {'repository': 'dangerouslaser/couch-installer'}, 'descriptor installer/OS identity'),
+                ('repository', {'config_repository': 'Couch-OS/couch-installer'}, 'descriptor installer/OS identity'),
+                ('wrong-input-repository', {'repository': 'Couch-OS/couch-installer'}, 'descriptor installer/OS identity'),
+                ('transferred-run-installer-descriptor', {'repository': 'Couch-OS/couch',
+                    'config_repository': 'Couch-OS/couch-installer'}, 'descriptor installer/OS identity'),
+                ('installer-run-transferred-descriptor', {'repository': 'Couch-OS/couch-installer',
+                    'config_repository': 'Couch-OS/couch'}, 'descriptor installer/OS identity'),
+                ('lowercase-owner-descriptor', {'repository': 'Couch-OS/couch',
+                    'config_repository': 'couch-os/couch'}, 'descriptor installer/OS identity'),
+                ('other-owner-descriptor', {'repository': 'Couch-OS/couch',
+                    'config_repository': 'other/couch'}, 'descriptor installer/OS identity'),
                 ('payload', {'payload_source': prepare.SOURCE}, 'descriptor installer/OS identity'),
                 ('installer', {'installer_source': prepare.PAYLOAD_SOURCE}, 'descriptor installer/OS identity'),
                 ('host', {'run_source': prepare.PAYLOAD_SOURCE}, 'source/status'),
@@ -137,9 +153,14 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(legacy['schema'], 1)
             self.assertEqual(legacy['source_commit'], prepare.SOURCE)
             self.assertEqual(legacy['payload_source_commit'], prepare.PAYLOAD_SOURCE)
+            invoke(root/'legacy-transferred', legacy=True, repository='Couch-OS/couch')
+            with self.assertRaisesRegex(ValueError, 'Legacy public descriptor'):
+                invoke(root/'legacy-installer-repository', legacy=True, repository='Couch-OS/couch-installer')
 
     def test_unknown_repository_rejected_before_external_access(self):
-        for repository in ('other/couch-installer', 'dangerouslaser/other', '../other', 'https://example.com'):
+        for repository in ('other/couch-installer', 'dangerouslaser/other', '../other', 'https://example.com',
+                           'couch-os/couch', 'Couch-OS/Couch', 'Couch-OS/other', 'dangerouslaser/couch-installer',
+                           'other/couch'):
             with self.subTest(repository=repository), patch.object(prepare, 'INSTALLER_REPOSITORY', repository), patch.object(prepare.subprocess, 'check_output') as external:
                 with self.assertRaisesRegex(ValueError, 'installer repository'):
                     prepare.prepare(Path('.'), Path('.'), Path('unused'))
@@ -172,7 +193,8 @@ class AdmissionTests(unittest.TestCase):
             for name in ('couch-installer-host-windows-x64.exe', 'couch-installer-tui-windows-x64.exe'):
                 (root/'assets'/name).write_bytes(b'fixture')
             (root/'assets/installer.json').write_text(json.dumps({
-                'schema': 1, 'version': 'v0.1.0-alpha.20260910.24'}))
+                'schema': 1, 'version': 'v0.1.0-alpha.20260910.24',
+                'payload': {'url': 'https://github.com/dangerouslaser/couch/releases/download/v0.1.0-alpha.20260910.24/payload.tar.gz'}}))
             script = '''$ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Net.Http
 $client=[Net.Http.HttpClient]::new()

@@ -42,7 +42,7 @@ export CC_armv7_unknown_linux_musleabihf="$PWD/tools/installer/toolchain/arm-mus
 ```sh
 python3 tools/installer/bump_version.py v0.1.1
 python3 tools/installer/release_descriptor.py \
-  --installer-repository dangerouslaser/couch-installer \
+  --installer-repository Couch-OS/couch-installer \
   --os-config /path/to/reviewed-os/installer.json \
   --source-commit INSTALLER_SOURCE_COMMIT \
   --output /path/to/new-assets/installer.json
@@ -57,6 +57,13 @@ separately and pins the exact OS archive. Existing schema-1 descriptors remain
 supported. Installer release tags are `installer-v…`; OS payload tags remain
 `v…` in the Couch repository. Metadata generation neither rebuilds nor publishes
 the OS payload.
+
+Couch is moving from `dangerouslaser/couch` to `Couch-OS/couch`. Published
+descriptors keep the old name, and GitHub redirects it, so descriptor checks,
+the native host and release discovery accept OS payloads and legacy installer
+releases under exactly those two names. Installer releases may also come from
+`Couch-OS/couch-installer`. Any other owner, repository or letter case is
+refused. `dangerouslaser/couch` remains the default until the transfer.
 
 The standalone [source collector](tools/installer/source/README.md) collects this
 exact Git commit and all four locked Cargo workspaces. It requires dependency

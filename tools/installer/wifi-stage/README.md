@@ -18,6 +18,12 @@ the static authenticated TLS/USB service. Cellular modem firmware and unused
 library dependencies are excluded. Identical ELF aliases share symlink targets.
 The original kernel and DTB are retained.
 
+When the image carries `/lib/couch-wmt-properties.so`, `wifi-init` preloads that
+narrow Android property bridge into the WMT launcher only. The installer consumes
+the built ARM object through `image/neutral_ramdisk.py --wmt-properties`; its
+source (`src/wmt-properties.c`) and build belong to Couch, which ships the same
+bridge in the runtime.
+
 `wifi-init` discovers only the connectivity character-device majors. It does not
 scan/create all device nodes, load obsolete vendor modules, replay Android
 properties, mount userdata, or write boot markers. The only block device packaged

@@ -79,6 +79,49 @@ class IndependentRelease(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'OS release URL'):
             descriptor.validate(config)
 
+    def test_couch_repository_transfer_admits_exactly_both_names(self):
+        config = descriptor.prepare(self.input, self.root / 'installer.json', 'v1.2.3', 'c' * 40)
+        payload = 'https://github.com/{}/releases/download/v0.1.0-alpha.1/payload.tar.gz'
+        installer = 'https://github.com/{}/releases/download/installer-v1.2.3'
+        # Published descriptors keep the old name; the OS and installer may each
+        # be on either side of the transfer.
+        for os_repository in ('dangerouslaser/couch', 'Couch-OS/couch'):
+            for installer_repository in ('dangerouslaser/couch', 'Couch-OS/couch', 'Couch-OS/couch-installer'):
+                with self.subTest(os=os_repository, installer=installer_repository):
+                    candidate = copy.deepcopy(config)
+                    candidate['payload']['url'] = payload.format(os_repository)
+                    candidate['installer']['release_url'] = installer.format(installer_repository)
+                    self.assertEqual(descriptor.validate(candidate)[2]['url'], payload.format(os_repository))
+                    legacy = copy.deepcopy(self.legacy)
+                    legacy['payload']['url'] = payload.format(os_repository)
+                    self.assertEqual(descriptor.validate(legacy)[0]['release_url'],
+                                     f'https://github.com/{os_repository}/releases/download/v0.1.0-alpha.1')
+        for repository in ('couch-os/couch', 'Couch-OS/Couch', 'Couch-OS/couch-os', 'Couch-OS/other', 'other/couch',
+                           'Dangerouslaser/couch', 'dangerouslaser/couch-installer', 'dangerouslaser/Couch-OS/couch',
+                           'Couch-OS/couch.git'):
+            with self.subTest(repository=repository):
+                candidate = copy.deepcopy(config)
+                candidate['installer']['release_url'] = installer.format('Couch-OS/couch')
+                candidate['payload']['url'] = payload.format(repository)
+                with self.assertRaisesRegex(ValueError, 'OS release URL'):
+                    descriptor.validate(candidate)
+                legacy = copy.deepcopy(self.legacy)
+                legacy['payload']['url'] = payload.format(repository)
+                with self.assertRaisesRegex(ValueError, 'OS release URL'):
+                    descriptor.validate(legacy)
+                candidate['payload']['url'] = payload.format('Couch-OS/couch')
+                candidate['installer']['release_url'] = installer.format(repository)
+                with self.assertRaisesRegex(ValueError, 'release URL differs'):
+                    descriptor.validate(candidate)
+                with self.assertRaisesRegex(ValueError, 'Unsupported installer repository'):
+                    descriptor.prepare(self.input, self.root / 'refused.json', 'v1.2.3', 'c' * 40,
+                                       installer_repository=repository)
+        self.assertFalse((self.root / 'refused.json').exists())
+        transferred = descriptor.prepare(self.input, self.root / 'transferred.json', 'v1.2.3', 'c' * 40,
+                                         installer_repository='Couch-OS/couch')
+        self.assertEqual(transferred['installer']['release_url'], installer.format('Couch-OS/couch'))
+        self.assertEqual(transferred['payload'], self.legacy['payload'])
+
     def test_schema1_normalizes_without_repackaging(self):
         installer, os_release, payload = descriptor.validate(self.legacy)
         self.assertEqual(installer['version'], os_release['version'])

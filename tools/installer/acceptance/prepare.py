@@ -13,7 +13,11 @@ SOURCE = os.environ.get('SOURCE_COMMIT', '57a3e22b4e86d8d6620dbaedbf30847e26b9bb
 PAYLOAD_SOURCE = os.environ.get('PAYLOAD_SOURCE_COMMIT', '271704728c77c13add1763aea7d1f9bd629c63ca')
 INSTALLER_VERSION = os.environ.get('INSTALLER_VERSION', 'v0.1.0')
 INSTALLER_REPOSITORY = os.environ.get('INSTALLER_REPOSITORY', 'dangerouslaser/couch')
-INSTALLER_REPOSITORIES = ('dangerouslaser/couch', 'Couch-OS/couch-installer')
+# Couch under its current and transferred names: one repository, which built
+# the historical installers and publishes OS payloads. New installers come from
+# Couch-OS/couch-installer.
+COUCH_REPOSITORIES = ('dangerouslaser/couch', 'Couch-OS/couch')
+INSTALLER_REPOSITORIES = COUCH_REPOSITORIES + ('Couch-OS/couch-installer',)
 OS_VERSION = os.environ.get('OS_VERSION', 'v0.1.0-alpha.20260910.24')
 # Kept for the frozen fixture helpers which predate separate installer releases.
 VERSION = OS_VERSION
@@ -48,19 +52,23 @@ def prepare(downloads, frozen, output):
         raise ValueError('Public descriptor hash differs')
     metadata = json.loads(config)
     legacy = metadata.get('schema') == 1
+    # A descriptor published under Couch's old name names the same repository
+    # as a run selected under its transferred name, and the reverse.
+    release_repositories = (COUCH_REPOSITORIES if INSTALLER_REPOSITORY in COUCH_REPOSITORIES
+                            else (INSTALLER_REPOSITORY,))
     if legacy:
-        if (INSTALLER_REPOSITORY != 'dangerouslaser/couch'
+        if (INSTALLER_REPOSITORY not in COUCH_REPOSITORIES
                 or metadata.get('kind') != 'couch-native-installer-release'
                 or metadata.get('version') != OS_VERSION
                 or metadata.get('source_commit') != PAYLOAD_SOURCE):
             raise ValueError('Legacy public descriptor OS identity differs')
         launcher_version = OS_VERSION
     elif (metadata.get('schema') != 2 or metadata.get('kind') != 'couch-native-installer-release'
-            or metadata.get('installer') != {
+            or metadata.get('installer') not in [{
                 'version': INSTALLER_VERSION,
                 'source_commit': SOURCE,
-                'release_url': f'https://github.com/{INSTALLER_REPOSITORY}/releases/download/installer-{INSTALLER_VERSION}',
-            }
+                'release_url': f'https://github.com/{repository}/releases/download/installer-{INSTALLER_VERSION}',
+            } for repository in release_repositories]
             or metadata.get('os') != {
                 'version': OS_VERSION,
                 'source_commit': PAYLOAD_SOURCE,

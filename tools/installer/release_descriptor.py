@@ -9,8 +9,13 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parent
-DOWNLOAD = 'https://github.com/dangerouslaser/couch/releases/download/'
-INSTALLER_REPOSITORIES = ('dangerouslaser/couch', 'Couch-OS/couch-installer')
+# The Couch repository publishes OS payloads and the historical installer
+# releases. It moves from dangerouslaser/couch to Couch-OS/couch; published
+# descriptors keep the old name and GitHub redirects it, so exactly these two
+# spellings are admitted. The first stays the default until the transfer.
+COUCH_REPOSITORIES = ('dangerouslaser/couch', 'Couch-OS/couch')
+INSTALLER_REPOSITORIES = COUCH_REPOSITORIES + ('Couch-OS/couch-installer',)
+DOWNLOAD = f'https://github.com/{COUCH_REPOSITORIES[0]}/releases/download/'
 PROTOCOL = 1
 VERSION = r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?'
 
@@ -20,9 +25,21 @@ def require(value, message):
         raise ValueError(message)
 
 
+def download(repository):
+    return f'https://github.com/{repository}/releases/download/'
+
+
 def installer_release_url(repository, version):
     require(repository in INSTALLER_REPOSITORIES, 'Unsupported installer repository')
-    return f'https://github.com/{repository}/releases/download/installer-{version}'
+    return download(repository) + 'installer-' + version
+
+
+def os_repository(url, pattern):
+    """The Couch repository whose exact release URL shape matches, else None."""
+    if not isinstance(url, str):
+        return None
+    return next((repository for repository in COUCH_REPOSITORIES
+                 if re.fullmatch(re.escape(download(repository)) + pattern, url)), None)
 
 
 def identity(value):
@@ -38,10 +55,14 @@ def validate(config):
             and config.get('kind') == 'couch-native-installer-release'
             and config.get('model') == 'sanytron-ha100', 'Invalid public installer configuration')
     common = {'schema', 'kind', 'model', 'payload'}
+    payload = config.get('payload')
+    url = payload.get('url') if isinstance(payload, dict) else None
     if config['schema'] == 1:
         require(set(config) == common | {'version', 'source_commit'}, 'Invalid public installer configuration')
         installer = {key: config[key] for key in ('version', 'source_commit')}
-        installer['release_url'] = DOWNLOAD + config['version']
+        # Schema 1 shares one release: the installer lives beside its payload.
+        repository = os_repository(url, r'[A-Za-z0-9._-]+/[A-Za-z0-9._-]+')
+        installer['release_url'] = download(repository or COUCH_REPOSITORIES[0]) + str(config['version'])
         os_release = {key: config[key] for key in ('version', 'source_commit')}
         os_release['installation_protocol'] = PROTOCOL
     elif config['schema'] == 2:
@@ -60,15 +81,13 @@ def validate(config):
     identity(os_release)
     require(type(os_release['installation_protocol']) is int and os_release['installation_protocol'] == PROTOCOL,
             'Unsupported installation protocol')
-    payload = config['payload']
-    url_pattern = (re.escape(DOWNLOAD) + r'[A-Za-z0-9._-]+/[A-Za-z0-9._-]+' if config['schema'] == 1
-                   else re.escape(DOWNLOAD + os_release['version'] + '/') + r'[A-Za-z0-9_][A-Za-z0-9._-]*')
+    url_pattern = (r'[A-Za-z0-9._-]+/[A-Za-z0-9._-]+' if config['schema'] == 1
+                   else re.escape(os_release['version'] + '/') + r'[A-Za-z0-9_][A-Za-z0-9._-]*')
     require(isinstance(payload, dict) and set(payload) == {'url', 'size', 'sha256', 'format'}
             and payload['format'] == 'tar.gz' and type(payload['size']) is int
             and 0 < payload['size'] <= 1024**3 and isinstance(payload['sha256'], str)
             and re.fullmatch('[0-9a-f]{64}', payload['sha256'])
-            and isinstance(payload['url'], str)
-            and re.fullmatch(url_pattern, payload['url']),
+            and os_repository(url, url_pattern) is not None,
             'Invalid public payload pin or OS release URL')
     return installer, os_release, payload
 
@@ -107,7 +126,8 @@ def main():
     parser.add_argument('--version', default=(ROOT / 'VERSION').read_text().strip())
     parser.add_argument('--source-commit', required=True, help='Exact source commit used for installer binaries')
     parser.add_argument('--installer-repository', choices=INSTALLER_REPOSITORIES,
-                        help='Reviewed installer repository (default: dangerouslaser/couch)')
+                        help='Reviewed installer repository: Couch-OS/couch-installer, or the Couch repository '
+                             'under its current or transferred name (default: dangerouslaser/couch)')
     parser.add_argument('--release-url', help='Exact installer-version GitHub release directory in a reviewed repository')
     args = parser.parse_args()
     prepare(args.os_config, args.output, args.version, args.source_commit, args.release_url, args.installer_repository)

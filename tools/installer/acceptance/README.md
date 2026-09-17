@@ -18,12 +18,19 @@ The frozen host-source generator must reproduce the independently supplied launc
 hash. The admission receipt records both identities and the selected installer repository. No executable or launcher is
 patched for the test.
 
-The installer repository input is restricted to `dangerouslaser/couch` and
-`Couch-OS/couch-installer`. It selects the build-run API, frozen generator
-checkout and binary artifact download, and must match the schema-2 descriptor's
-exact `installer-v…` release URL. The OS payload remains pinned to
-`dangerouslaser/couch`. Historical schema-1 fixtures use that original repository
-for the installer as well. No repository is inferred from downloaded metadata.
+The installer repository input is restricted to `dangerouslaser/couch`,
+`Couch-OS/couch` and `Couch-OS/couch-installer`. It selects the build-run API,
+frozen generator checkout and binary artifact download, and must match the
+schema-2 descriptor's exact `installer-v…` release URL. The first two are Couch
+before and after its transfer. They name one repository, so a run selected under
+either name admits a descriptor published under either name.
+`Couch-OS/couch-installer` matches only itself. The default stays
+`dangerouslaser/couch` until the transfer. After it, select `Couch-OS/couch` for
+historical builds: the artifact download does not follow the old name's API
+redirect. The OS payload stays in Couch under either name. Historical schema-1
+fixtures use Couch for the installer as well, and the HTTPS fixture serves them
+under their payload's Couch name. No repository is inferred from downloaded
+metadata.
 
 Runs using artifacts from the same repository use the workflow token. For
 cross-repository runs, configure `INSTALLER_ARTIFACT_TOKEN` with read access to

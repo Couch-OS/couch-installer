@@ -44,6 +44,25 @@ class Launchers(unittest.TestCase):
             checker.write_text('param([string]$Target)\n$tokens=$null; $errors=$null; [System.Management.Automation.Language.Parser]::ParseFile($Target,[ref]$tokens,[ref]$errors) | Out-Null; if($errors.Count){throw ($errors | Out-String)}')
             subprocess.run(['powershell', '-NoProfile', '-File', str(checker), '-Target', str(self.output / 'install.ps1')], check=True)
 
+    def test_schema1_launchers_follow_the_couch_repository_name_only(self):
+        config = json.loads((self.assets / 'installer.json').read_text())
+        payload = 'https://github.com/{}/releases/download/v0.1.0-alpha.1/payload.tar.gz'
+        for repository in ('dangerouslaser/couch', 'Couch-OS/couch'):
+            config['payload']['url'] = payload.format(repository)
+            (self.assets / 'installer.json').write_text(json.dumps(config))
+            output = self.root / repository.replace('/', '-')
+            receipt = launchers.generate(self.assets, output, self.version)
+            expected = f'https://github.com/{repository}/releases/download/{self.version}'
+            self.assertEqual(receipt['installer']['release_url'], expected)
+            for name in ('install.sh', 'install.ps1'):
+                self.assertIn(f"'{expected}'", (output / name).read_text())
+        for repository in ('couch-os/couch', 'Couch-OS/couch-installer', 'other/couch'):
+            config['payload']['url'] = payload.format(repository)
+            (self.assets / 'installer.json').write_text(json.dumps(config))
+            with self.subTest(repository=repository), self.assertRaisesRegex(ValueError, 'OS release URL'):
+                launchers.generate(self.assets, self.output, self.version)
+            self.assertFalse(self.output.exists())
+
     def test_invalid_version_or_private_configuration_never_generates(self):
         for value in ("v1.2.3';echo bad", '../v1.2.3', 'latest'):
             with self.assertRaisesRegex(ValueError, 'version'):

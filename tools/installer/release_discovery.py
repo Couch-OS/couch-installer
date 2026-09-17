@@ -10,9 +10,18 @@ from urllib.request import Request, HTTPRedirectHandler, build_opener
 
 from couch_install import MODEL, InstallError, require
 
+# Couch moves from dangerouslaser/couch to Couch-OS/couch. Discovery still asks
+# the old name until the transfer. Afterwards GitHub redirects that API path to
+# the repository's permanent numeric ID, redirects old download URLs to the new
+# owner, and reports the new owner in browser_download_url. Exactly these two
+# names and this one repository ID are accepted; no other owner is.
 REPOSITORY = 'dangerouslaser/couch'
+REPOSITORIES = (REPOSITORY, 'Couch-OS/couch')
+REPOSITORY_ID = 1363054496
 API = f'https://api.github.com/repos/{REPOSITORY}/releases'
-DOWNLOAD = f'https://github.com/{REPOSITORY}/releases/download/'
+TRANSFERRED_API = f'https://api.github.com/repositories/{REPOSITORY_ID}/releases'
+DOWNLOADS = tuple(f'https://github.com/{repository}/releases/download/' for repository in REPOSITORIES)
+DOWNLOAD = DOWNLOADS[0]
 MAX_MANIFEST = 256 * 1024
 MAX_LIST = 4 * 1024 * 1024
 # The tags this repository cuts: v0.1.0, v0.1.0-alpha.1, the dated
@@ -24,19 +33,30 @@ CHANNELS = ('stable', 'alpha', 'dev')
 SHA = re.compile(r'^[0-9a-f]{64}$')
 
 
+def release_path(url):
+    """The part of a Couch release download URL below either repository name."""
+    return next((url[len(prefix):] for prefix in DOWNLOADS if url.startswith(prefix)), None)
+
+
 class MetadataRedirects(HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, msg, headers, newurl):
         parsed = urlparse(newurl)
-        require(request.full_url.startswith(DOWNLOAD)
-                and parsed.scheme == 'https' and parsed.hostname == 'release-assets.githubusercontent.com'
-                and parsed.username is None and parsed.password is None and parsed.port in (None, 443),
+        source = request.full_url
+        path = release_path(source)
+        require(parsed.scheme == 'https' and parsed.username is None and parsed.password is None
+                and parsed.port in (None, 443)
+                and (path is not None and (parsed.hostname == 'release-assets.githubusercontent.com'
+                                           # The same release asset under the other Couch name.
+                                           or newurl != source and release_path(newurl) == path)
+                     # The old API path, answered by the repository's permanent ID.
+                     or source.startswith(API + '?') and newurl == TRANSFERRED_API + source[len(API):]),
                 'Unexpected release metadata redirect')
         return super().redirect_request(request, fp, code, msg, headers, newurl)
 
 
 def fetch_bytes(url, limit):
     """Bounded metadata request only; callers never pass an executable asset."""
-    require(url.startswith(API + '?') or url.startswith(DOWNLOAD), 'Unsupported metadata origin')
+    require(url.startswith(API + '?') or release_path(url) is not None, 'Unsupported metadata origin')
     request = Request(url, headers={'Accept': 'application/vnd.github+json',
                                    'X-GitHub-Api-Version': '2026-03-10',
                                    'User-Agent': 'couch-release-discovery'})
@@ -61,7 +81,8 @@ class Selection:
     sha256: str
 
     def record(self):
-        return {**asdict(self), 'repository': REPOSITORY, 'model': MODEL,
+        repository = next(name for name, prefix in zip(REPOSITORIES, DOWNLOADS) if self.url.startswith(prefix))
+        return {**asdict(self), 'repository': repository, 'model': MODEL,
                 'publisher_signature_verified': False, 'installation_authorized': False}
 
 
@@ -117,16 +138,17 @@ def selections(releases, channel='stable', exact=None):
             continue
         require(len(candidates) == 1 and tag not in seen, 'Ambiguous release manifest')
         asset = candidates[0]
-        expected_url = DOWNLOAD + tag + '/' + name
+        # Either Couch name: the API reports whichever owner holds the repository now.
+        url = asset.get('browser_download_url')
         digest = asset.get('digest', '')
         require(type(release.get('id')) is int and release['id'] > 0
                 and type(asset.get('id')) is int and asset['id'] > 0, 'Invalid release/asset identifier')
-        require(asset.get('state') == 'uploaded' and asset.get('browser_download_url') == expected_url,
+        require(asset.get('state') == 'uploaded' and isinstance(url, str) and release_path(url) == tag + '/' + name,
                 'Manifest must be an uploaded version-specific repository asset')
         require(type(asset.get('size')) is int and 0 < asset['size'] <= MAX_MANIFEST, 'Invalid manifest size')
         require(isinstance(digest, str) and digest.startswith('sha256:') and SHA.fullmatch(digest[7:]),
                 'Manifest asset has no usable SHA-256 metadata')
-        result.append(Selection(tag, channel, release['id'], asset['id'], name, expected_url, asset['size'], digest[7:]))
+        result.append(Selection(tag, channel, release['id'], asset['id'], name, url, asset['size'], digest[7:]))
         seen.add(tag)
     return sorted(result, key=lambda selected: order(selected.tag), reverse=True)
 
@@ -167,7 +189,9 @@ def inspect_manifest(selected, fetch=fetch_bytes):
         require(type(entry.get('size')) is int and 0 < entry['size'] <= 8 * 1024**3,
                 'Invalid manifest file size')
         require(isinstance(entry.get('sha256'), str) and SHA.fullmatch(entry['sha256']), 'Invalid manifest file hash')
-        require(entry.get('url') == DOWNLOAD + selected.tag + '/' + name, 'Invalid manifest file URL')
+        # Manifests published before the transfer keep the old repository name.
+        require(isinstance(entry.get('url'), str) and release_path(entry['url']) == selected.tag + '/' + name,
+                'Invalid manifest file URL')
         seen.add(name)
     # A remotely asserted installable:true never overrides local policy.
     return value

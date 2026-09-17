@@ -12,9 +12,10 @@ unchanged against the runtime baseline before and after. Every partition is read
 back and hashed independently after writing. One explicit attempt, no resume.
 
 The manifest must be a reviewed factory-restore bundle built from the pinned
-vendor archive (see tools/release/firmware_restore.py and
-ha100_factory_firmware.json): sparse images already expanded, every image a raw
-full-partition image of the exact device size with a recorded sha256.
+vendor archive (see pins/firmware_restore.py and Couch's
+tools/release/ha100_factory_firmware.json): sparse images already expanded,
+every image a raw full-partition image of the exact device size with a recorded
+sha256.
 """
 import argparse
 import hashlib

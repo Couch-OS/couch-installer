@@ -18,6 +18,12 @@ the static authenticated TLS/USB service. Cellular modem firmware and unused
 library dependencies are excluded. Identical ELF aliases share symlink targets.
 The original kernel and DTB are retained.
 
+When the image carries `/lib/couch-wmt-properties.so`, `wifi-init` preloads that
+narrow Android property bridge into the WMT launcher only. The installer consumes
+the built ARM object through `image/neutral_ramdisk.py --wmt-properties`; its
+source (`src/wmt-properties.c`) and build belong to Couch, which ships the same
+bridge in the runtime.
+
 `wifi-init` discovers only the connectivity character-device majors. It does not
 scan/create all device nodes, load obsolete vendor modules, replay Android
 properties, mount userdata, or write boot markers. The only block device packaged
@@ -54,7 +60,7 @@ layout; the init script still mounts no device partitions. Original backups,
 image writes, close/fsync and full direct readback are enforced before final
 boot. The host includes the entered network in a privately customized OS image,
 so that network intentionally persists in the newly installed Couch system.
-See [private flow](../../../docs/installer-linux-usb-stage.md) and the
+See [private flow](https://github.com/dangerouslaser/couch/blob/dev/docs/installer-linux-usb-stage.md) and the
 [protocol extension](../linux_stage/PROTOCOL.md).
 
 The host checks radio readiness before requesting an SSID or password. The

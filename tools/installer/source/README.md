@@ -43,12 +43,11 @@ that compiler or standard library. Publication must still compare each native
 build receipt's compiler identity and target sysroot hashes with the selected
 Rust source/toolchain receipt.
 
-The compatibility CLI at `tools/release/corresponding_source.py` exposes the
-same path by adding `--scope installer` to `project`, `cargo`,
-`cargo-notices`, `external`, and `assemble`.
+This collector is the only installer source path. Couch's full-scope OS
+collector does not duplicate it: it takes installer files from the commit its
+`couch-installer` gitlink records.
 
-Run the source-scope regression tests from either the Couch checkout or a
-standalone repository export:
+Run the source-scope regression tests from this repository or a source export:
 
 ```sh
 python3 -m unittest discover -s tools/installer -p test_corresponding_source.py

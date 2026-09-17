@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import zipfile
 
@@ -21,11 +22,39 @@ BOOTSTRAP_MEMBERS = {
 }
 
 
+def source_checkouts(module=__file__):
+    """Return the file-relative source root and every Git superproject embedding it.
+
+    Inside a Git submodule parents[3] is only the submodule root, so owner output
+    could otherwise land in the checkout that embeds it. Git reports each
+    enclosing superproject. Without Git, outside any checkout or when Git refuses
+    the repository, only the file-relative root is known and it stays refused.
+    """
+    module = Path(module).resolve()
+    roots, directory = [module.parents[3]], module.parent
+    # Discover from this file's location, never from an inherited GIT_DIR.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    for _ in range(8):
+        try:
+            result = subprocess.run(['git', '-C', str(directory), 'rev-parse', '--show-superproject-working-tree'],
+                                    stdin=subprocess.DEVNULL, capture_output=True, timeout=10, env=environment)
+        except (OSError, subprocess.SubprocessError):
+            break
+        superproject = os.fsdecode(result.stdout.rstrip(b'\r\n'))
+        if result.returncode != 0 or not superproject:
+            break
+        directory = Path(superproject).resolve()
+        if directory in roots:
+            break
+        roots.append(directory)
+    return roots
+
+
 def prepare(ota, output, *, runtime=True):
     ota, output = Path(ota), Path(output)
     pin = json.loads(official_runtime.PIN.read_text())
     require(not output.exists() and not output.is_symlink(), 'Use a new private output directory')
-    require(not output.resolve().is_relative_to(Path(__file__).resolve().parents[3]),
+    require(not any(output.resolve().is_relative_to(root) for root in source_checkouts()),
             'Keep owner-held vendor inputs outside the source repository')
     require(ota.is_file() and not ota.is_symlink() and ota.stat().st_size == pin['size'],
             'Wrong regular official OTA file or size')

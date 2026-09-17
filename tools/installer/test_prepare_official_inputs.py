@@ -1,12 +1,16 @@
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+import uuid
 import zipfile
 
-from pin_modules import load as load_pin
+from pin_modules import load as load_pin, nested_checkouts
 
 inputs = load_pin('prepare_official_inputs')
 
@@ -62,6 +66,41 @@ class OwnerInputTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 inputs.prepare(self.ota, self.root/'output')
         self.assertFalse((self.root/'output').exists())
+
+    def test_output_in_enclosing_superproject_is_refused_before_reading_archive(self):
+        # Inside a submodule parents[3] is only the submodule root; Git names the
+        # checkout that embeds it, and owner vendor inputs must stay out of that too.
+        destination = self.root/'output'
+        superproject = subprocess.CompletedProcess([], 0, stdout=os.fsencode(self.root) + b'\n')
+        outermost = subprocess.CompletedProcess([], 0, stdout=b'')
+        with patch.object(inputs.subprocess, 'run', side_effect=[superproject, outermost]), \
+             patch.object(inputs, 'file_sha') as hashed:
+            with self.assertRaisesRegex(ValueError, 'outside the source repository'):
+                self.prepare(destination)
+            hashed.assert_not_called()
+        self.assertFalse(destination.exists())
+
+    def test_without_git_the_file_relative_checkout_is_still_refused(self):
+        repository = Path(inputs.__file__).resolve().parents[3]
+        inside = repository/('.couch-owner-inputs-fixture-' + uuid.uuid4().hex)
+        self.addCleanup(shutil.rmtree, inside, ignore_errors=True)
+        failures = (FileNotFoundError('git'), subprocess.TimeoutExpired('git', 10),
+                    subprocess.CompletedProcess([], 128, stdout=b'', stderr=b'fatal: not a git repository'))
+        for index, failure in enumerate(failures):
+            with self.subTest(failure=failure):
+                effect = {'side_effect': failure} if isinstance(failure, BaseException) else {'return_value': failure}
+                with patch.object(inputs.subprocess, 'run', **effect):
+                    self.assertEqual(inputs.source_checkouts(), [repository])
+                    with self.assertRaisesRegex(ValueError, 'outside the source repository'):
+                        self.prepare(inside)
+                    self.assertFalse(inside.exists())
+                    self.assertFalse(self.prepare(self.root/f'output-{index}')['installable'])
+
+    @unittest.skipUnless(shutil.which('git'), 'Git is required for the submodule fixture')
+    def test_git_reports_every_superproject_enclosing_a_submodule_checkout(self):
+        checkouts = nested_checkouts(self.root)
+        module = checkouts[0]/'tools/installer/pins/prepare_official_inputs.py'
+        self.assertEqual(inputs.source_checkouts(module), checkouts)
 
 
 if __name__ == '__main__':

@@ -5,9 +5,14 @@ imports ``private_vendor``), exactly as they do when run from the pins directory
 or copied beside the native worker. Each dependency is registered under that
 name before its dependant runs, so tests patch the same module objects the
 helpers use. No copy or compatibility shim sits in between.
+
+``nested_checkouts`` builds the Git submodule layout that the owner output
+guards must see through.
 """
 from importlib.util import module_from_spec, spec_from_file_location
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 PINS = Path(__file__).resolve().parent / 'pins'
@@ -39,3 +44,32 @@ def load(name):
         del sys.modules[name]
         raise
     return module
+
+
+def nested_checkouts(root):
+    """Create outer/middle/installer, each checkout a gitlink in its parent's index.
+
+    Returns the checkout roots innermost first, with an installer-layout pins
+    directory in the innermost one. No network, remote or hooks are involved.
+    """
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    outer = Path(root).resolve() / 'outer'
+
+    def git(directory, *words):
+        # Neutralize user configuration that would sign, prompt or run hooks.
+        command = ['git', '-C', str(directory), '-c', 'user.name=Fixture',
+                   '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+                   '-c', 'core.hooksPath=' + str(Path(root).resolve() / 'no-hooks'), *words]
+        return subprocess.run(command, check=True, capture_output=True, text=True,
+                              timeout=30, env=environment).stdout.strip()
+
+    chain = [outer, outer / 'middle', outer / 'middle' / 'installer']
+    for directory in chain:
+        directory.mkdir()
+        git(directory, 'init', '-q')
+    (chain[-1] / 'tools' / 'installer' / 'pins').mkdir(parents=True)
+    for parent, child in zip(chain, chain[1:]):
+        git(child, 'commit', '-q', '--allow-empty', '-m', 'fixture')
+        commit = git(child, 'rev-parse', 'HEAD')
+        git(parent, 'update-index', '--add', '--cacheinfo', f'160000,{commit},{child.name}')
+    return chain[::-1]

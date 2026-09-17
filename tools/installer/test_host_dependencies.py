@@ -1,12 +1,16 @@
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+import uuid
 import zipfile
 
-from pin_modules import load as load_pin
+from pin_modules import load as load_pin, nested_checkouts
 
 dependencies = load_pin('host_dependencies')
 download, prepare, smoke = dependencies.download, dependencies.prepare, dependencies.smoke
@@ -83,6 +87,44 @@ class DependenciesTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'new output'):
             prepare(self.archive, self.output, 'fixture', self.metadata)
         self.assertEqual(self.data, (self.output / 'platform-tools/adb').read_bytes())
+
+    def test_output_in_enclosing_superproject_is_refused_before_reading_archive(self):
+        # Inside a submodule parents[3] is only the submodule root; Git names the
+        # checkout that embeds it, and owner output must stay out of that too.
+        self.fixture()
+        superproject = subprocess.CompletedProcess([], 0, stdout=os.fsencode(self.root) + b'\n')
+        outermost = subprocess.CompletedProcess([], 0, stdout=b'')
+        with patch.object(dependencies.subprocess, 'run', side_effect=[superproject, outermost]), \
+                patch.object(dependencies, 'hash_stream') as hashed:
+            with self.assertRaisesRegex(ValueError, 'outside the source checkout'):
+                prepare(self.archive, self.output, 'fixture', self.metadata)
+            hashed.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_without_git_the_file_relative_checkout_is_still_refused(self):
+        self.fixture()
+        inside = dependencies.REPO / ('.couch-owner-output-fixture-' + uuid.uuid4().hex)
+        self.addCleanup(shutil.rmtree, inside, ignore_errors=True)
+        failures = (FileNotFoundError('git'), subprocess.TimeoutExpired('git', 10),
+                    subprocess.CompletedProcess([], 128, stdout=b'', stderr=b'fatal: not a git repository'))
+        for index, failure in enumerate(failures):
+            with self.subTest(failure=failure):
+                effect = {'side_effect': failure} if isinstance(failure, BaseException) else {'return_value': failure}
+                with patch.object(dependencies.subprocess, 'run', **effect):
+                    self.assertEqual(dependencies.source_checkouts(), [dependencies.REPO])
+                    with self.assertRaisesRegex(ValueError, 'outside the source checkout'):
+                        prepare(self.archive, inside, 'fixture', self.metadata)
+                    self.assertFalse(inside.exists())
+                    output = self.root / f'output-{index}'
+                    prepare(self.archive, output, 'fixture', self.metadata)
+                self.assertEqual(self.data, (output / 'platform-tools/adb').read_bytes())
+
+    @unittest.skipUnless(shutil.which('git'), 'Git is required for the submodule fixture')
+    def test_git_reports_every_superproject_enclosing_a_submodule_checkout(self):
+        checkouts = nested_checkouts(self.root)
+        module = checkouts[0] / 'tools/installer/pins/host_dependencies.py'
+        self.assertEqual(dependencies.source_checkouts(module), checkouts)
+        self.assertEqual(dependencies.source_checkouts(self.root / 'a/b/c/host_dependencies.py'), [self.root.resolve()])
 
     def test_cross_platform_smoke_refused_without_execution(self):
         self.fixture()

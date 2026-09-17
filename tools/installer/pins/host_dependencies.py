@@ -23,6 +23,34 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def source_checkouts(module=__file__):
+    """Return the file-relative source root and every Git superproject embedding it.
+
+    Inside a Git submodule parents[3] is only the submodule root, so owner output
+    could otherwise land in the checkout that embeds it. Git reports each
+    enclosing superproject. Without Git, outside any checkout or when Git refuses
+    the repository, only the file-relative root is known and it stays refused.
+    """
+    module = Path(module).resolve()
+    roots, directory = [module.parents[3]], module.parent
+    # Discover from this file's location, never from an inherited GIT_DIR.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    for _ in range(8):
+        try:
+            result = subprocess.run(['git', '-C', str(directory), 'rev-parse', '--show-superproject-working-tree'],
+                                    stdin=subprocess.DEVNULL, capture_output=True, timeout=10, env=environment)
+        except (OSError, subprocess.SubprocessError):
+            break
+        superproject = os.fsdecode(result.stdout.rstrip(b'\r\n'))
+        if result.returncode != 0 or not superproject:
+            break
+        directory = Path(superproject).resolve()
+        if directory in roots:
+            break
+        roots.append(directory)
+    return roots
+
+
 def host_platform():
     system, machine = platform.system(), platform.machine().lower()
     if system == 'Darwin' and machine in ('arm64', 'x86_64'):
@@ -75,7 +103,8 @@ def prepare(archive, destination, selected, metadata):
     pin = metadata['platforms'][selected]
     destination = Path(destination).absolute()
     require(not destination.exists() and not destination.is_symlink(), 'Use a new output directory')
-    require(destination.parent.is_dir() and not destination.resolve().is_relative_to(REPO),
+    require(destination.parent.is_dir()
+            and not any(destination.resolve().is_relative_to(root) for root in source_checkouts()),
             'Output must be outside the source checkout with an existing parent')
     require(not Path(archive).is_symlink(), 'Archive must not be a symlink')
     # Hash and parse the same open file; never re-open an unverified path for ZIP extraction.

@@ -178,7 +178,10 @@ class AdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = root/'console.ps1'
-            script.write_text('[Console]::WriteLine("Reinstall existing Couch / Cancel"); 1..4 | ForEach-Object { $null = [Console]::ReadKey($true) }; [Console]::WriteLine("SESSION ENDED Enter / Esc close"); $null = [Console]::ReadKey($true); exit 0')
+            # The menu stub consumes exactly the presses the fixture sends: one
+            # Down per DOWN_PRESSES, then Enter.
+            menu_keys = windows_console.DOWN_PRESSES + 1
+            script.write_text(f'[Console]::WriteLine("Reinstall existing Couch / Cancel"); 1..{menu_keys} | ForEach-Object {{ $null = [Console]::ReadKey($true) }}; [Console]::WriteLine("SESSION ENDED Enter / Esc close"); $null = [Console]::ReadKey($true); exit 0')
             with patch.dict(os.environ, {'LOCALAPPDATA':str(root/'owner')}):
                 result = windows_console.run(script, root/'console.txt')
             self.assertTrue(result['cancel_selected'])

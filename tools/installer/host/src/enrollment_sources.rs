@@ -145,6 +145,13 @@ fn native_enrollment(dir: &Path) -> bool {
     dir.join("enrollment.json").is_file() && !couch_snapshot(dir)
 }
 
+/// An older verified Python export: it has no enrollment.json, but carries
+/// the bootstrap journal its import requires.
+fn legacy_export(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join("bootstrap").join("journal.json"))
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
 /// The date of a folder's `enrollment.json`, read from its metadata only.
 fn saved_at(dir: &Path) -> Option<SystemTime> {
     let metadata = fs::symlink_metadata(dir.join("enrollment.json")).ok()?;
@@ -206,11 +213,13 @@ pub fn discover(state_root: &Path, remembered: Option<PathBuf>) -> Vec<Candidate
         // reinstall record is never an Android enrollment.
         if path.is_dir() && !couch_snapshot(path) {
             let native = native_enrollment(path);
+            // A remembered session that has lost its enrollment.json is not
+            // an older export, whatever else it holds; it is offered undated.
             let candidate = Candidate {
                 path: path.clone(),
                 origin: Origin::Remembered,
                 saved: if native { saved_at(path) } else { None },
-                legacy: !native,
+                legacy: !native && legacy_export(path),
             };
             if native {
                 sessions.push(candidate);
@@ -577,7 +586,8 @@ mod tests {
         let native = dated(root.path(), "install-a2baa68b63cc958a", 1_789_282_200);
         let elsewhere = TempDir::new().unwrap();
         let legacy = elsewhere.path().join("python-run");
-        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(legacy.join("bootstrap")).unwrap();
+        fs::write(legacy.join("bootstrap/journal.json"), b"{}").unwrap();
         let found = discover(root.path(), Some(legacy.clone()));
         assert_eq!(found[0].label(), "Older verified backup · python-run");
         assert_eq!(
@@ -598,8 +608,13 @@ mod tests {
         for candidate in &found {
             assert!(!candidate.detail().to_lowercase().contains("storage id"));
         }
+        // A remembered session that lost its enrollment.json is not called an
+        // older backup.
+        let lost = session(root.path(), "install-lost", &[]);
+        let found = discover(root.path(), Some(lost));
+        assert_eq!(found[0].label(), "Saved at an unknown time · install-lost");
+        assert!(found[0].detail().contains("Used last time."));
     }
-
     #[test]
     fn utc_minute_formats_known_instants() {
         assert_eq!(utc_minute(at(951_782_400)), "2000-02-29 00:00 UTC");

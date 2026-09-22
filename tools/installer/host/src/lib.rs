@@ -11,6 +11,7 @@ pub mod frontend;
 pub mod network;
 pub mod orchestrator;
 pub mod public_inputs;
+pub mod recovery;
 pub mod saved_enrollment;
 pub mod session;
 pub mod space;

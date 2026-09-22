@@ -97,7 +97,7 @@ fn choice(label: &str, detail: &str) -> Choice {
         detail: detail.into(),
     }
 }
-fn state_root() -> Result<PathBuf> {
+pub(crate) fn state_root() -> Result<PathBuf> {
     #[cfg(windows)]
     let path = PathBuf::from(
         std::env::var_os("LOCALAPPDATA").context("missing local application data directory")?,
@@ -459,11 +459,21 @@ pub fn run(ui: &mut Ui, config: Option<&Path>, local_payload: Option<&Path>) -> 
                 "Restore stock Android",
                 "Write your saved Android originals and a fresh stock filesystem. Couch is replaced.",
             ),
+            choice(
+                "My remote shows COUCH RECOVERY",
+                "Get a remote that keeps starting into recovery back to normal. Nothing is reinstalled.",
+            ),
             choice("Cancel", "Leave the device unchanged."),
         ],
     )?;
-    if mode == 4 {
+    if mode == 5 {
         return Ok(());
+    }
+    // Leaving recovery needs no release configuration, no downloads and no
+    // installation session: it clears one flag on a remote that is already
+    // installed. Keep it ahead of everything the installation flow requires.
+    if mode == 4 {
+        return crate::recovery::run(ui);
     }
     // Restore shares the reinstall bootstrap path: the device currently runs Couch
     // and a saved Android enrollment is imported and re-bound before any write.
@@ -1114,10 +1124,21 @@ mod tests {
     #[test]
     fn cancel_never_requires_release_config_or_creates_session() {
         let mut ui = Ui::new(
-            Box::new(Cursor::new(b"{\"id\":1,\"value\":\"4\"}\n".to_vec())),
+            Box::new(Cursor::new(b"{\"id\":1,\"value\":\"5\"}\n".to_vec())),
             Box::new(Vec::new()),
         );
         run(&mut ui, None, None).unwrap();
+    }
+    #[test]
+    fn leaving_recovery_is_offered_before_the_release_configuration_is_required() {
+        // Selecting it with no remote connected reaches its own first screen
+        // and stops there when the terminal answers nothing further.
+        let mut ui = Ui::new(
+            Box::new(Cursor::new(b"{\"id\":1,\"value\":\"4\"}\n".to_vec())),
+            Box::new(Vec::new()),
+        );
+        let error = format!("{:#}", run(&mut ui, None, None).unwrap_err());
+        assert!(!error.contains("release configuration"), "{error}");
     }
     #[test]
     fn images_use_fixed_wire_chunks_and_full_digest() {

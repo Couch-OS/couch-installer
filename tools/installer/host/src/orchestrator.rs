@@ -337,7 +337,7 @@ fn enrollment_source(
         } else {
             let mut options: Vec<Choice> = candidates
                 .iter()
-                .map(|found| choice(&found.path.display().to_string(), found.detail()))
+                .map(|found| choice(&found.label(), &found.detail()))
                 .collect();
             options.push(choice("Enter a folder path", "Type the location yourself."));
             if offer_fresh {
@@ -1445,7 +1445,7 @@ mod tests {
             options[1..],
             ["Enter a folder path", "I don't have a saved enrollment"]
         );
-        assert_eq!(options[0], folder.display().to_string());
+        assert!(options[0].ends_with(" · install-aaaa"), "{}", options[0]);
         let (mut ui, _) = terminal(&["2", "0"]);
         assert_eq!(
             enrollment_source(&mut ui, root.path(), true, false).unwrap(),

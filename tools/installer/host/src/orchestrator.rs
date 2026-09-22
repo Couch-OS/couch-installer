@@ -153,6 +153,25 @@ fn prepared_worker(
     )?;
     Ok(worker)
 }
+/// USB product IDs of the MediaTek preloader and download agent.
+const DOWNLOAD_MODE_PIDS: [u64; 6] = [0x0003, 0x6000, 0x2000, 0x2001, 0x20ff, 0x3000];
+/// What to tell someone asked to connect a running Couch when none is found.
+/// A remote still in download mode shows up with a download-mode identity
+/// instead: an earlier attempt stopped after its read-only capture (every
+/// refusal there leaves the download agent running) and it needs a power
+/// cycle before it can start Couch again.
+fn connect_couch_prompt(devices: &[Value]) -> &'static str {
+    if devices.iter().any(|device| {
+        device["pid"]
+            .as_u64()
+            .is_some_and(|pid| DOWNLOAD_MODE_PIDS.contains(&pid))
+    }) {
+        "Your remote is still in download mode from an earlier attempt. Hold the side Power \
+         button until it turns off, then start it again."
+    } else {
+        "Keep Couch powered on and connected through USB so its physical port can be selected."
+    }
+}
 /// Wait for the selected physical port to show a download-mode identity, then
 /// start the read-only download-agent session on it. Nothing is written here.
 fn download_mode(worker: &mut Worker, bound: &Value, ui: &mut Ui) -> Result<Value> {
@@ -170,9 +189,9 @@ fn download_mode(worker: &mut Worker, bound: &Value, ui: &mut Ui) -> Result<Valu
             .filter(|d| {
                 d["bus"] == bound["bus"]
                     && d["ports"] == bound["ports"]
-                    && d["pid"].as_u64().is_some_and(|pid| {
-                        [0x0003, 0x6000, 0x2000, 0x2001, 0x20ff, 0x3000].contains(&pid)
-                    })
+                    && d["pid"]
+                        .as_u64()
+                        .is_some_and(|pid| DOWNLOAD_MODE_PIDS.contains(&pid))
             })
             .collect::<Vec<_>>();
         ensure!(found.len() <= 1, "ambiguous selected USB port");
@@ -834,14 +853,22 @@ fn install(
                 ui,
                 1,
             )?;
-            let candidates = result["devices"]
+            let devices = result["devices"]
                 .as_array()
-                .context("invalid USB inventory")?
+                .context("invalid USB inventory")?;
+            let candidates = devices
                 .iter()
                 .filter(|d| d["pid"] == 0x201c)
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
-                ui.choose("Connect the Couch remote", "Keep Couch powered on and connected through USB so its physical port can be selected.",&[choice("Check USB again","No write or reboot has been requested.")])?;
+                ui.choose(
+                    "Connect the Couch remote",
+                    connect_couch_prompt(devices),
+                    &[choice(
+                        "Check USB again",
+                        "No write or reboot has been requested.",
+                    )],
+                )?;
                 continue;
             }
             let options = candidates
@@ -1452,6 +1479,23 @@ mod tests {
             assert!(body.contains("Restore stock Android will not be available"));
             assert!(body.contains("The installer never writes calibration."));
             assert!(body.contains("choose Install with Android backup instead"));
+        }
+    }
+
+    #[test]
+    fn a_remote_left_in_download_mode_is_told_to_power_off() {
+        let couch = json!({"bus":1,"address":5,"ports":[4],"vid":0x0e8d,"pid":0x201c});
+        let other = json!({"bus":1,"address":6,"ports":[3],"vid":0x05ac,"pid":0x0250});
+        assert!(connect_couch_prompt(&[]).starts_with("Keep Couch powered on"));
+        assert!(
+            connect_couch_prompt(std::slice::from_ref(&other)).starts_with("Keep Couch powered on")
+        );
+        for pid in DOWNLOAD_MODE_PIDS {
+            let mut stuck = couch.clone();
+            stuck["pid"] = json!(pid);
+            let prompt = connect_couch_prompt(&[other.clone(), stuck]);
+            assert!(prompt.contains("still in download mode"), "{pid:#x}");
+            assert!(prompt.contains("Hold the side Power button until it turns off"));
         }
     }
 

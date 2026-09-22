@@ -24,10 +24,30 @@ from mtk_session import Candidate, ReadPolicy, loader_bytes, source_pin
 from mtk_usb import ExactUsbBackend, supervised_operations
 from mtk_writer import ConnectedMtkWriter
 from stage_usb import StageUsb
-from couch_serial import CouchSerial, Unavailable
+from couch_serial import CouchSerial, Unavailable, open_couch_port
 
 MAX = 1024 * 1024
 READABLE = IDENTITY_PARTITIONS | {'boot', 'recovery', 'odmdtbo', 'logo'}
+
+
+def couch_candidate(raw):
+    """The selected running-Couch port, checked exactly as couch_reboot always has."""
+    require(isinstance(raw, dict) and set(raw) == {'bus', 'address', 'ports', 'vid', 'pid'}
+            and raw['vid'] == 0x0e8d and raw['pid'] == 0x201c
+            and type(raw['bus']) is int and raw['bus'] > 0
+            and isinstance(raw['ports'], list) and raw['ports']
+            and all(type(n) is int and 0 < n <= 255 for n in raw['ports']), 'Invalid Couch port')
+    return Candidate(raw['bus'], raw['address'], tuple(raw['ports']), raw['vid'], raw['pid'])
+
+
+def couch_query_port(platform=sys.platform):
+    """How the read-only identity query reaches Couch's serial function.
+
+    Windows binds its serial-port driver to it, so the query goes through that
+    COM port, found by physical port chain as the RAM stage's is. The reboot
+    keeps its libusb-only route, so on Windows it stays a manual restart.
+    """
+    return open_couch_port if platform == 'win32' else None
 
 
 class Wire:
@@ -217,22 +237,38 @@ class Adapter:
             self.wire.send({'event': 'android_bound', 'bus': matches[0].bus,
                 'ports': list(matches[0].port_numbers),
                 'serial_sha256': hashlib.sha256(command['serial'].encode()).hexdigest()})
+        elif op == 'couch_identify':
+            # Read-only and repeatable until the reboot is consumed or the
+            # download-agent session starts. Unavailable is an answer, not a
+            # failure: the host decides whether to ask again or go manual.
+            require(set(command) == {'op', 'candidate'} and self.backend is not None
+                    and self.reader is None and not getattr(self, 'couch_reboot_consumed', False),
+                    'Invalid Couch identity state')
+            selected = couch_candidate(command['candidate'])
+            serial = None
+            try:
+                with self.wire.deadline(15):
+                    serial = CouchSerial(self.backend.usb, self.backend.usb_backend, selected,
+                                         serial_port=couch_query_port())
+                    cid, flag, uptime = serial.identify()
+                event = {'event': 'couch_identity', 'result': 'observed', 'cid': cid,
+                         'boot_flag_sha256': flag, 'uptime': uptime}
+            except Unavailable as unavailable:
+                event = {'event': 'couch_identity', 'result': 'unavailable', 'reason': unavailable.reason}
+            finally:
+                if serial is not None:
+                    serial.close()
+            self.wire.send(event)
         elif op == 'couch_reboot':
             require(set(command) == {'op', 'candidate', 'cid'} and self.backend is not None
                     and self.reader is None and not getattr(self, 'couch_reboot_consumed', False),
                     'Invalid Couch reboot state')
-            raw = command['candidate']
-            require(isinstance(raw, dict) and set(raw) == {'bus', 'address', 'ports', 'vid', 'pid'}
-                    and raw['vid'] == 0x0e8d and raw['pid'] == 0x201c
-                    and type(raw['bus']) is int and raw['bus'] > 0
-                    and isinstance(raw['ports'], list) and raw['ports']
-                    and all(type(n) is int and 0 < n <= 255 for n in raw['ports']), 'Invalid Couch port')
+            selected = couch_candidate(command['candidate'])
             self.couch_reboot_consumed = True
             serial = None
             try:
                 with self.wire.deadline(15):
-                    serial = CouchSerial(self.backend.usb, self.backend.usb_backend,
-                        Candidate(raw['bus'], raw['address'], tuple(raw['ports']), raw['vid'], raw['pid']))
+                    serial = CouchSerial(self.backend.usb, self.backend.usb_backend, selected)
                     serial.restart(command['cid'])
                 result = 'requested'
             except Unavailable:
@@ -358,7 +394,8 @@ def serve(wire, factory=Adapter):
 CATEGORIES = {'USBError', 'USBTimeoutError', 'InstallError', 'OSError',
               'PermissionError', 'TimeoutError', 'ValueError', 'TypeError',
               'AttributeError', 'RuntimeError'}
-REVIEWED_SOURCES = {'mtk_adapter.py', 'mtk_usb.py', 'mtk_tty.py', 'mtk_com.py', 'stage_usb.py', 'mtk_readonly.py', 'mtk_writer.py'}
+REVIEWED_SOURCES = {'mtk_adapter.py', 'mtk_usb.py', 'mtk_tty.py', 'mtk_com.py', 'stage_usb.py', 'mtk_readonly.py',
+                    'mtk_writer.py', 'couch_serial.py'}
 
 
 def _observed(error):

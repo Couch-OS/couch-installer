@@ -215,9 +215,19 @@ pub enum Readiness {
     /// to be confirmed before it is restarted.
     Confirm,
 }
-pub fn readiness(observation: &Observation, waited: bool) -> Readiness {
+/// `waited` is set once this check has already waited for the remote to
+/// finish starting; `retry` when the remote has only just come back by itself
+/// after a missed download window.
+pub fn readiness(observation: &Observation, waited: bool, retry: bool) -> Readiness {
     match (observation.flag, observation.uptime) {
         (BootFlag::Clear, _) => Readiness::Restart,
+        // An unknown flag says nothing about readiness, so a remote that has
+        // not been up three minutes gets them before the user is asked to
+        // confirm; one that just came back with no uptime gets the full wait.
+        (BootFlag::Unknown, Some(uptime)) if uptime < COUCH_SETTLE && !waited => {
+            Readiness::Wait(COUCH_SETTLE - uptime)
+        }
+        (BootFlag::Unknown, None) if retry && !waited => Readiness::Wait(COUCH_SETTLE),
         (BootFlag::Unknown, _) => Readiness::Confirm,
         (BootFlag::Armed, Some(uptime)) if uptime >= STUCK_UPTIME => Readiness::Stuck,
         (BootFlag::Armed, _) if waited => Readiness::NotReady,
@@ -330,6 +340,8 @@ pub struct CouchBinding {
     /// `expected` came from a saved enrollment (Reinstall, Restore), not from
     /// this remote's own answer.
     enrolled: bool,
+    /// The remote was restarted (over USB or by hand) for an earlier attempt.
+    restarted: bool,
     recorded: usize,
     last: Option<(String, &'static str)>,
 }
@@ -339,6 +351,7 @@ impl CouchBinding {
         Self {
             expected: Some(cid.into()),
             enrolled: true,
+            restarted: false,
             recorded: 0,
             last: None,
         }
@@ -348,6 +361,7 @@ impl CouchBinding {
         Self {
             expected: None,
             enrolled: false,
+            restarted: false,
             recorded: 0,
             last: None,
         }
@@ -355,6 +369,27 @@ impl CouchBinding {
     /// The CID download mode must report, when one is known.
     pub fn expected(&self) -> Option<&str> {
         self.expected.as_deref()
+    }
+    /// What this installation has done to the remote so far, for a stop or a
+    /// failure before its next restart.
+    fn untouched(&self) -> &'static str {
+        if self.restarted {
+            "Nothing was written to the remote; it was restarted once already, for an earlier \
+             attempt to reach download mode"
+        } else {
+            "Nothing was written and the remote was not restarted"
+        }
+    }
+    /// The refusal when the user stops before the restart.
+    fn stopped(&self) -> String {
+        if self.restarted {
+            format!(
+                "Stopped before the remote was restarted again. {}",
+                self.untouched()
+            )
+        } else {
+            STOPPED.into()
+        }
     }
     fn bind(&mut self, cid: &str) -> Result<()> {
         match &self.expected {
@@ -422,7 +457,12 @@ fn ask(
     };
     let mut attempt = 0;
     loop {
-        let identity = serial_identity(&port.identify(bound, ui)?)?;
+        let untouched = binding.untouched();
+        let identity = serial_identity(
+            &port
+                .identify(bound, ui)
+                .with_context(|| format!("Asking the remote over USB failed. {untouched}"))?,
+        )?;
         binding.record(session, bound, &identity)?;
         attempt += 1;
         if matches!(identity, SerialIdentity::Observed(_)) || attempt >= limit {
@@ -513,15 +553,24 @@ fn confirm(ui: &mut Ui, confirmation: Confirmation) -> Result<bool> {
 }
 
 /// The remote would start COUCH RECOVERY next. `true` means check again.
-fn not_ready(ui: &mut Ui) -> Result<bool> {
+/// `offer_clear` promises the clear only where it will be offered: the remote
+/// reports its uptime, so the installer can tell when it is stuck.
+fn not_ready(ui: &mut Ui, offer_clear: bool, untouched: &str) -> Result<bool> {
+    let next = if offer_clear {
+        "If it still reports COUCH RECOVERY then, the installer offers to clear that and \
+         restart it straight into the installer."
+    } else {
+        "If it goes back to COUCH RECOVERY every time it starts, choose Stop, run the installer \
+         again and choose My remote shows COUCH RECOVERY first."
+    };
     Ok(ui.choose(
         "The remote is not ready yet",
-        "The remote reports that it would start into COUCH RECOVERY next. That is normal for \
-         about three minutes after Couch starts, and it is always the case while the screen \
-         shows COUCH RECOVERY.\n\nWait until the remote has been on for three minutes, \
-         whichever screen it shows, and check again. If it still reports COUCH RECOVERY then, \
-         the installer offers to clear that and restart it straight into the installer.\n\n\
-         Nothing has been written and the remote has not been restarted.",
+        &format!(
+            "The remote reports that it would start into COUCH RECOVERY next. That is normal for \
+             about three minutes after Couch starts, and it is always the case while the screen \
+             shows COUCH RECOVERY.\n\nWait until the remote has been on for three minutes, \
+             whichever screen it shows, and check again. {next}\n\n{untouched}."
+        ),
         &[
             choice("Check again", "Asks the remote again."),
             choice("Stop", "Leave the remote as it is."),
@@ -568,7 +617,7 @@ fn stuck(ui: &mut Ui) -> Result<Stuck> {
 fn request(
     port: &mut impl CouchPort,
     bound: &Value,
-    binding: &CouchBinding,
+    binding: &mut CouchBinding,
     session: &mut SessionGuard,
     ui: &mut Ui,
 ) -> Result<()> {
@@ -583,7 +632,10 @@ fn request(
     )?;
     session.checkpoint(&json!({"event":"couch_restart","usb":bound,"result":restart["result"]}))?;
     match restart["result"].as_str() {
-        Some("requested") => Ok(()),
+        Some("requested") => {
+            binding.restarted = true;
+            Ok(())
+        }
         Some("unavailable") => {
             ui.choose(
                 "Restart the selected remote",
@@ -596,6 +648,7 @@ fn request(
                     "Only the selected physical USB port can be captured.",
                 )],
             )?;
+            binding.restarted = true;
             Ok(())
         }
         _ => bail!("Invalid Couch restart result"),
@@ -624,17 +677,22 @@ pub fn restart(
                     // the same time before asking the user to look.
                     wait_for_start(port, ui, 0, COUCH_SETTLE)?;
                 }
-                ensure!(confirm(ui, Confirmation::Manual(reason))?, "{STOPPED}");
+                ensure!(
+                    confirm(ui, Confirmation::Manual(reason))?,
+                    "{}",
+                    binding.stopped()
+                );
                 session.checkpoint(&json!({"event":"couch_restart","usb":bound,"result":"manual","reason":reason.name()}))?;
+                binding.restarted = true;
                 return Ok(());
             }
             SerialIdentity::Observed(observation) => {
                 binding.bind(&observation.cid)?;
                 answered = true;
-                match readiness(&observation, waited) {
+                match readiness(&observation, waited, retry) {
                     Readiness::Restart => return request(port, bound, binding, session, ui),
                     Readiness::Confirm => {
-                        ensure!(confirm(ui, Confirmation::Unknown)?, "{STOPPED}");
+                        ensure!(confirm(ui, Confirmation::Unknown)?, "{}", binding.stopped());
                         return request(port, bound, binding, session, ui);
                     }
                     Readiness::Wait(seconds) => {
@@ -642,7 +700,7 @@ pub fn restart(
                         waited = true;
                     }
                     Readiness::Stuck => match stuck(ui)? {
-                        Stuck::Stop => bail!("{STOPPED}"),
+                        Stuck::Stop => bail!("{}", binding.stopped()),
                         Stuck::CheckAgain => waited = false,
                         Stuck::Clear => {
                             let cid = observation.cid;
@@ -671,7 +729,11 @@ pub fn restart(
                         }
                     },
                     Readiness::NotReady => {
-                        ensure!(not_ready(ui)?, "{STOPPED}");
+                        ensure!(
+                            not_ready(ui, observation.uptime.is_some(), binding.untouched())?,
+                            "{}",
+                            binding.stopped()
+                        );
                         waited = false;
                     }
                 }
@@ -810,7 +872,11 @@ pub(crate) mod tests {
     impl CouchPort for Script {
         fn identify(&mut self, _: &Value, _: &mut Ui) -> Result<Value> {
             self.log.push("identify".into());
-            Ok(self.answers.pop_front().expect("unscripted identity query"))
+            // A scripted null is a worker that died mid-query.
+            match self.answers.pop_front().expect("unscripted identity query") {
+                Value::Null => anyhow::bail!("MTK worker stopped"),
+                answer => Ok(answer),
+            }
         }
         fn reboot(&mut self, _: &Value, cid: &str, _: &mut Ui) -> Result<Value> {
             self.log.push(format!("reboot {cid}"));
@@ -915,31 +981,66 @@ pub(crate) mod tests {
         };
         use BootFlag::*;
         for waited in [false, true] {
-            assert_eq!(readiness(&seen(Clear, Some(3)), waited), Readiness::Restart);
-            assert_eq!(readiness(&seen(Clear, None), waited), Readiness::Restart);
+            for retry in [false, true] {
+                let ready = |flag, uptime| readiness(&seen(flag, uptime), waited, retry);
+                assert_eq!(ready(Clear, Some(3)), Readiness::Restart);
+                assert_eq!(ready(Clear, None), Readiness::Restart);
+                assert_eq!(ready(Unknown, Some(180)), Readiness::Confirm);
+                assert_eq!(ready(Unknown, Some(900)), Readiness::Confirm);
+                assert_eq!(ready(Armed, Some(170)), Readiness::Stuck);
+                assert_eq!(ready(Armed, Some(4000)), Readiness::Stuck);
+            }
+        }
+        for retry in [false, true] {
             assert_eq!(
-                readiness(&seen(Unknown, Some(900)), waited),
+                readiness(&seen(Armed, Some(30)), false, retry),
+                Readiness::Wait(150)
+            );
+            assert_eq!(
+                readiness(&seen(Armed, Some(169)), false, retry),
+                Readiness::Wait(11)
+            );
+            assert_eq!(
+                readiness(&seen(Armed, None), false, retry),
+                Readiness::Wait(180)
+            );
+            assert_eq!(
+                readiness(&seen(Armed, Some(30)), true, retry),
+                Readiness::NotReady
+            );
+            assert_eq!(
+                readiness(&seen(Armed, None), true, retry),
+                Readiness::NotReady
+            );
+            // An unknown flag waits out the start-up health check before the
+            // user is asked to confirm, but only once.
+            assert_eq!(
+                readiness(&seen(Unknown, Some(40)), false, retry),
+                Readiness::Wait(140)
+            );
+            assert_eq!(
+                readiness(&seen(Unknown, Some(179)), false, retry),
+                Readiness::Wait(1)
+            );
+            assert_eq!(
+                readiness(&seen(Unknown, Some(40)), true, retry),
                 Readiness::Confirm
             );
-            assert_eq!(readiness(&seen(Armed, Some(170)), waited), Readiness::Stuck);
             assert_eq!(
-                readiness(&seen(Armed, Some(4000)), waited),
-                Readiness::Stuck
+                readiness(&seen(Unknown, None), true, retry),
+                Readiness::Confirm
             );
         }
+        // With no uptime, only a remote that has just come back gets the wait.
         assert_eq!(
-            readiness(&seen(Armed, Some(30)), false),
-            Readiness::Wait(150)
+            readiness(&seen(Unknown, None), false, false),
+            Readiness::Confirm
         );
         assert_eq!(
-            readiness(&seen(Armed, Some(169)), false),
-            Readiness::Wait(11)
+            readiness(&seen(Unknown, None), false, true),
+            Readiness::Wait(180)
         );
-        assert_eq!(readiness(&seen(Armed, None), false), Readiness::Wait(180));
-        assert_eq!(readiness(&seen(Armed, Some(30)), true), Readiness::NotReady);
-        assert_eq!(readiness(&seen(Armed, None), true), Readiness::NotReady);
     }
-
     #[test]
     fn reinstall_and_restore_wait_for_a_clear_flag_before_the_first_restart_and_every_retry() {
         for retry in [false, true] {
@@ -1354,10 +1455,16 @@ pub(crate) mod tests {
 
     #[test]
     fn an_unknown_flag_needs_the_screen_confirmed_before_a_usb_restart() {
+        let unknown = "e".repeat(64);
         for (reply, restarted) in [("0", true), ("1", false)] {
             let (_root, mut session) = private_session();
             let (mut ui, screen) = terminal(&[reply]);
-            let mut remote = Script::with(vec![observed(CID, &"e".repeat(64), Some(40))]);
+            // Up 40 s: it gets the rest of the three minutes before the user
+            // is asked, and is asked once more afterwards.
+            let mut remote = Script::with(vec![
+                observed(CID, &unknown, Some(40)),
+                observed(CID, &unknown, Some(181)),
+            ]);
             let result = restart(
                 &mut remote,
                 &port(),
@@ -1367,7 +1474,14 @@ pub(crate) mod tests {
                 &mut ui,
             );
             assert_eq!(result.is_ok(), restarted);
-            assert_eq!(remote.log.len(), if restarted { 2 } else { 1 });
+            let waited = Duration::from_secs(140);
+            if restarted {
+                assert_eq!(remote.log.len(), 3);
+                assert_eq!(remote.paused, waited + REOPEN_PAUSE);
+            } else {
+                assert_eq!(remote.log.len(), 2);
+                assert_eq!(remote.paused, waited);
+            }
             let prompts = screen.prompts();
             assert_eq!(prompts[0].0, "Check the remote's screen");
             assert!(prompts[0]
@@ -1375,6 +1489,174 @@ pub(crate) mod tests {
                 .contains("did not say whether its next start is a normal one"));
             assert_eq!(prompts[0].3, ["Continue", "Stop"]);
         }
+    }
+    #[test]
+    fn an_unknown_flag_waits_on_the_first_attempt_and_on_a_retry() {
+        let unknown = "e".repeat(64);
+        // First attempt, no uptime: it cannot be told, so the user is asked.
+        let (_root, mut session) = private_session();
+        let (mut ui, screen) = terminal(&["0"]);
+        let mut remote = Script::with(vec![observed(CID, &unknown, None)]);
+        let mut binding = CouchBinding::enrolled(CID);
+        restart(
+            &mut remote,
+            &port(),
+            &mut binding,
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(remote.paused, REOPEN_PAUSE);
+        assert_eq!(screen.prompts()[0].0, "Check the remote's screen");
+        // A retry right after it came back: the full three minutes first.
+        let (mut ui, _) = terminal(&["0"]);
+        let mut remote = Script::with(vec![
+            observed(CID, &unknown, None),
+            observed(CID, &unknown, None),
+        ]);
+        restart(
+            &mut remote,
+            &port(),
+            &mut binding,
+            true,
+            &mut session,
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(
+            remote.paused,
+            Duration::from_secs(COUCH_SETTLE) + REOPEN_PAUSE
+        );
+        assert_eq!(remote.log.len(), 3);
+        // A retry that reports 20 s of uptime waits the other 160 s.
+        let (mut ui, _) = terminal(&["0"]);
+        let mut remote = Script::with(vec![
+            observed(CID, &unknown, Some(20)),
+            observed(CID, &unknown, Some(181)),
+        ]);
+        restart(
+            &mut remote,
+            &port(),
+            &mut binding,
+            true,
+            &mut session,
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(remote.paused, Duration::from_secs(160) + REOPEN_PAUSE);
+    }
+
+    #[test]
+    fn the_clear_is_offered_only_for_an_armed_flag_with_a_known_uptime() {
+        // Unknown at 900 s: the confirmation screen, never the clear.
+        let (_root, mut session) = private_session();
+        let (mut ui, screen) = terminal(&["1"]);
+        let mut remote = Script::with(vec![observed(CID, &"e".repeat(64), Some(900))]);
+        assert!(restart(
+            &mut remote,
+            &port(),
+            &mut CouchBinding::enrolled(CID),
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .is_err());
+        assert_eq!(screen.prompts()[0].0, "Check the remote's screen");
+        assert_eq!(remote.log, ["identify"]);
+        // Silent: the manual screen, never the clear.
+        let (mut ui, screen) = terminal(&["1"]);
+        let mut remote = Script::with((0..3).map(|_| unavailable("no_answer")).collect());
+        assert!(restart(
+            &mut remote,
+            &port(),
+            &mut CouchBinding::enrolled(CID),
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .is_err());
+        assert_eq!(screen.prompts()[0].3, ["Continue and watch USB", "Stop"]);
+        assert!(remote.log.iter().all(|entry| entry == "identify"));
+        // Armed, still young after the wait, no uptime: not ready, and no
+        // promise of a clear the installer cannot judge.
+        let (mut ui, screen) = terminal(&["1"]);
+        let mut remote = Script::with(vec![
+            observed(CID, FLAG_ARMED_SHA256, None),
+            observed(CID, FLAG_ARMED_SHA256, None),
+        ]);
+        assert!(restart(
+            &mut remote,
+            &port(),
+            &mut CouchBinding::enrolled(CID),
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .is_err());
+        let prompts = screen.prompts();
+        assert_eq!(prompts[0].0, "The remote is not ready yet");
+        assert!(
+            !prompts[0].2.contains("offers to clear"),
+            "{}",
+            prompts[0].2
+        );
+        assert!(prompts[0].2.contains("My remote shows COUCH RECOVERY"));
+    }
+
+    #[test]
+    fn a_stop_or_failure_says_what_was_already_done_to_the_remote() {
+        let (_root, mut session) = private_session();
+        let mut binding = CouchBinding::enrolled(CID);
+        // A worker that dies mid-query: nothing written, nothing restarted.
+        let (mut ui, _) = terminal(&[]);
+        let mut remote = Script::with(vec![Value::Null]);
+        let error = restart(
+            &mut remote,
+            &port(),
+            &mut binding,
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Asking the remote over USB failed. Nothing was written and the remote was not \
+             restarted: MTK worker stopped"
+        );
+        // The first attempt restarts it; a stop on the retry must not claim
+        // it was never restarted.
+        let (mut ui, _) = terminal(&["2"]);
+        let mut remote = Script::with(vec![
+            observed(CID, FLAG_CLEAR_SHA256, Some(400)),
+            observed(CID, FLAG_ARMED_SHA256, Some(600)),
+        ]);
+        restart(
+            &mut remote,
+            &port(),
+            &mut binding,
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .unwrap();
+        let error = restart(
+            &mut remote,
+            &port(),
+            &mut binding,
+            true,
+            &mut session,
+            &mut ui,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("Stopped before the remote was restarted again"),
+            "{error}"
+        );
+        assert!(error.contains("restarted once already"), "{error}");
+        assert_ne!(error, STOPPED);
     }
 
     #[test]

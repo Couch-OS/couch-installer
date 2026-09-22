@@ -14,15 +14,20 @@ ZEROS = '\\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \
 
 class SerialTests(unittest.TestCase):
     def fixture(self, cid='1'*32, *, reboot_short=False, query_echo=False,
-                flag=FLAG_CLEAR_SHA256, uptime='1900', answers=1, noise=b'', echo=True):
+                flag=FLAG_CLEAR_SHA256, uptime='1900', answers=1, noise=b'', echo=True, wrap=False):
         serial = CouchSerial.__new__(CouchSerial)
         serial.attempted = False
         writes, pending = [], bytearray()
         def write(data, **kwargs):
             writes.append(data)
+            written = data
             if data == b'\n/bin/busybox sync; /bin/busybox reboot -f\n':
                 return 1 if reboot_short else len(data)
             marker = re.search(rb'COUCH_[0-9a-f]{32}', data).group()
+            if wrap:
+                # A terminal that wraps the echoed line can put a real line
+                # break right before the marker in the echo.
+                data = data.replace(marker, b'\r\n' + marker)
             if query_echo:
                 pending.extend(data)
             elif b'sha256sum' in data:
@@ -34,7 +39,7 @@ class SerialTests(unittest.TestCase):
                                    + b':' + uptime.encode() + b':END\r\n')
             else:
                 pending.extend(b'\n' + marker + b':' + cid.encode() + b':END\r\n')
-            return len(data)
+            return len(written)
         def read(size, **kwargs):
             if not pending:
                 raise RuntimeError('fixture has no more output')
@@ -124,6 +129,17 @@ class SerialTests(unittest.TestCase):
         with self.assertRaises(Unavailable) as raised: serial.identify()
         self.assertEqual(raised.exception.reason, 'no_answer')
 
+    def test_a_wrapped_echo_is_not_evidence_either(self):
+        # A real line break before the marker in the echo still leaves "%s"
+        # where the CID must be, so only the real answer can match.
+        serial, _ = self.fixture(query_echo=True, wrap=True)
+        with self.assertRaises(Unavailable) as raised: serial.identify()
+        self.assertEqual(raised.exception.reason, 'no_answer')
+        serial, _ = self.fixture(query_echo=True, wrap=True)
+        with self.assertRaises(Unavailable): serial.restart('1'*32)
+        serial, _ = self.fixture(wrap=True)
+        self.assertEqual(serial.identify(), ('1'*32, FLAG_CLEAR_SHA256, 1900))
+
     def test_identify_two_answers_refuse(self):
         # Two framed answers arriving together are ambiguous, never a choice.
         serial, _ = self.fixture(answers=2, echo=False)
@@ -204,28 +220,35 @@ class SerialTests(unittest.TestCase):
             CouchSerial(usb, object(), NS(bus=2, ports=(4,)), serial_port=no_port)
         self.assertEqual(raised.exception.reason, 'cannot_open')
 
-    def test_the_com_port_is_found_by_couch_identity_and_physical_port(self):
-        seen = []
+    def open_couch(self, ports, *, selected=(4, 2)):
+        opened = []
         class Transport:
             def __init__(self, name, usb, **kwargs):
-                seen.append(name)
-        import mtk_com
-        ports = [NS(device='COM7', vid=0x0e8d, pid=0x201c, location='1-4.2:x.1'),
-                 NS(device='COM8', vid=0x0e8d, pid=0x201c, location='1-3:x.1'),
-                 NS(device='COM9', vid=0x0e8d, pid=0x2000, location='1-4.2')]
-        original = mtk_com.open_serial_port
-        def opener(candidate, number, usb, **kwargs):
-            self.assertEqual((candidate.vid, candidate.pid, candidate.ports), (0x0e8d, 0x201c, (4, 2)))
-            return original(candidate, number, usb, comports=lambda: ports, transport=Transport, **kwargs)
-        import couch_serial
-        couch_serial.open_serial_port, saved = opener, couch_serial.open_serial_port
-        try:
-            open_couch_port(NS(bus=1, ports=(4, 2)), object())
-        finally:
-            couch_serial.open_serial_port = saved
-        self.assertEqual(seen, ['COM7'])
+                opened.append(name)
+        ticks = itertools.count()
+        result = open_couch_port(NS(bus=1, ports=selected), object(), comports=lambda: ports,
+                                 transport=Transport, now=lambda: next(ticks), sleep=lambda s: None)
+        return result, opened
 
-
+    def test_the_windows_query_takes_only_the_exact_physical_port(self):
+        couch = lambda device, location: NS(device=device, vid=0x0e8d, pid=0x201c, location=location)
+        _, opened = self.open_couch([couch('COM7', '1-4.2:x.1'), couch('COM8', '1-3:x.1'),
+                                     NS(device='COM9', vid=0x0e8d, pid=0x2000, location='1-4.2'),
+                                     couch('COM5', None)])
+        self.assertEqual(opened, ['COM7'])
+        # Never a port whose location Windows did not report: it may be
+        # another remote. That ends in the manual restart, not a guess.
+        for ports in ([couch('COM5', None)], [couch('COM5', 'unknown')], [couch('COM8', '1-3:x.1')],
+                      [couch('COM7', '1-4.2.1:x.1')], []):
+            with self.assertRaises(Unavailable) as raised:
+                self.open_couch(ports)
+            self.assertEqual(raised.exception.reason, 'cannot_open')
+        # Two ports on the same chain (different controllers) are ambiguous.
+        with self.assertRaises(Unavailable) as raised:
+            self.open_couch([couch('COM7', '1-4.2:x.1'), couch('COM11', '2-4.2:x.1')])
+        self.assertEqual(raised.exception.reason, 'cannot_open')
+        with self.assertRaises(Unavailable):
+            self.open_couch([couch(r'\\.\COM7', '1-4.2:x.1')])
 
 class FlagClearTests(unittest.TestCase):
     """A remote whose shell answers the identity query and the framed commands."""

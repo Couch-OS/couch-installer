@@ -11,8 +11,7 @@ import re
 import secrets
 import time
 from couch_install import InstallError, require
-from mtk_com import open_serial_port
-from mtk_session import Candidate
+from mtk_com import PORT, SerialTransport, comports_windows, port_chain
 
 # Every writer of the bootloader control block (mmcblk0p10) writes a whole
 # 512-byte block, so only two values are legitimate. All zeros means the next
@@ -27,8 +26,11 @@ REASONS = frozenset(('absent', 'no_serial_function', 'cannot_open', 'no_answer')
 CLEAR_BCB = b'dd if=/dev/zero of=/dev/mmcblk0p10 bs=512 count=1 conv=notrunc; sync'
 READ_BACK = b'dd if=/dev/mmcblk0p10 bs=512 count=1 2>/dev/null | od -An -c | head -1'
 # A running Couch has had its COM port for a long time; this only covers
-# Windows starting its serial driver right after the remote reconnected.
-COUCH_PORT_WAIT = 6.0
+# Windows starting its serial driver right after the remote reconnected. With
+# the transport's own 2 s open retry and the 5 s answer bound, a query stays
+# well inside the worker's 22 s deadline, so a slow port ends in the manual
+# restart rather than a killed worker.
+COUCH_PORT_WAIT = 4.0
 
 
 class Unavailable(Exception):
@@ -47,15 +49,39 @@ class Unavailable(Exception):
         self.reason = reason
 
 
-def open_couch_port(selected, usb):
+def open_couch_port(selected, usb, *, comports=comports_windows, transport=SerialTransport,
+                    wait=COUCH_PORT_WAIT, now=time.monotonic, sleep=time.sleep):
     """Couch's CDC ACM function as the COM port Windows created for it.
 
     Windows binds its own serial-port driver to the function and libusb
-    cannot claim it, so the port is found the way the RAM stage's is: by
-    vendor, product and the selected physical port chain.
+    cannot claim it, so the port is found by vendor, product and the selected
+    physical port chain, and only by an exact match of that chain. Unlike the
+    RAM stage's lookup, a port whose location Windows did not report is never
+    taken: it could belong to another remote. No match, or more than one, is
+    `cannot_open`, and the host falls back to the manual restart.
+
+    The root-hub number in Windows' location string counts root hubs within
+    one host controller, not libusb's bus numbers, so it cannot be compared;
+    two remotes on the same port chain of different controllers are refused
+    as ambiguous rather than told apart. The CID the remote then reports is
+    still checked against the enrollment, or against download mode.
     """
-    couch = Candidate(selected.bus, 0, selected.ports, 0x0e8d, 0x201c)
-    return open_serial_port(couch, 0, usb, services=lambda vid, pid: [], wait=COUCH_PORT_WAIT)
+    chain = tuple(selected.ports)
+    deadline = now() + wait
+    while True:
+        exact = [p for p in comports()
+                 if getattr(p, 'vid', None) == 0x0e8d and getattr(p, 'pid', None) == 0x201c
+                 and isinstance(getattr(p, 'device', None), str)
+                 and port_chain(getattr(p, 'location', None)) == chain]
+        if len(exact) > 1:
+            raise Unavailable('cannot_open', 'More than one Couch serial port on the selected port chain')
+        if exact:
+            if not PORT.match(exact[0].device):
+                raise Unavailable('cannot_open', 'Unexpected Couch serial port name')
+            return transport(exact[0].device, usb, now=now, sleep=sleep)
+        if now() >= deadline:
+            raise Unavailable('cannot_open', 'No Couch serial port on the selected physical port')
+        sleep(0.05)
 
 
 class CouchSerial:

@@ -270,7 +270,7 @@ raise SystemExit(serve_stdio(Fixture))
         self.assertEqual(len(closed), 3)
         self.assertEqual(len(opened), 3)
         self.assertEqual(opened[0][0].ports, (4, 1))
-        self.assertEqual(wire.events.count(('deadline', 15)), 4)
+        self.assertEqual(wire.events.count(('deadline', 22)), 4)
         self.assertFalse(adapter.failed)
 
     def test_couch_identify_repeats_but_is_refused_after_reboot_or_start(self):

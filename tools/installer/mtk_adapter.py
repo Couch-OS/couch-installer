@@ -247,7 +247,9 @@ class Adapter:
             selected = couch_candidate(command['candidate'])
             serial = None
             try:
-                with self.wire.deadline(15):
+                # Bounded well above the COM port wait plus the 5 s answer, and
+                # under the host's 25 s: a slow port ends as unavailable.
+                with self.wire.deadline(22):
                     serial = CouchSerial(self.backend.usb, self.backend.usb_backend, selected,
                                          serial_port=couch_query_port())
                     cid, flag, uptime = serial.identify()

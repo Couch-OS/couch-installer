@@ -133,6 +133,15 @@ def admit(source, expected_temporary_boot_sha256):
                     and record['original_os'] == 'Couch' and evidence['cid'] == record['cid'],
                     'Retained binding mismatch')
             rebound = True
+        if label == 'couch_device_bound':
+            # Reinstall without a saved Android enrollment: the running Couch
+            # was bound by its own CID before any backup. It restores exactly
+            # like a retained reinstall; no Android originals exist.
+            require(phase == 'android_bound' and kind == 'transition' and evidence['original_os'] == 'Couch'
+                    and record['original_os'] == 'Couch' and evidence['cid'] == record['cid']
+                    and evidence.get('android_enrollment') == 'none'
+                    and record.get('android_enrollment') == 'none', 'Couch binding mismatch')
+            rebound = True
         if label == 'android_bound':
             # Fresh enrollment: live Android was bound to this CID before any backup.
             require(phase == 'android_bound' and kind == 'transition' and record['original_os'] == 'Android'

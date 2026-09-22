@@ -25,9 +25,11 @@ use std::time::{Duration, Instant};
 /// happens to answer.
 const PROBE_CMDLINE: &str = "cat /proc/cmdline";
 /// Recovery mounts the Couch filesystem (`mmcblk0p23`) at `/mnt/alpine` and
-/// checks for exactly this file before using it. A normal Couch boot has that
-/// filesystem as its root and no `/mnt/alpine` at all, so an answer here is
-/// what says "this is the recovery system, with a Couch installation attached".
+/// checks for exactly this file before using it, so an answer here says a
+/// Couch installation is attached. It does NOT tell recovery from a normal
+/// boot: normal Couch's init mounts the same filesystem at the same place,
+/// and its serial shell runs beside that mount. Only the boot control block
+/// itself says which system starts next.
 const PROBE_COUCH: &str = "test -f /mnt/alpine/opt/couch/stage2.sh && echo ok";
 /// The runtime slot the next normal boot will start. An absent symlink is the
 /// built-in base runtime, which is a legitimate state after a full rollback.

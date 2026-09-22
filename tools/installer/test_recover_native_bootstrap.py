@@ -119,6 +119,45 @@ class RecoveryTests(unittest.TestCase):
             self.event('stage_connected','checkpoint',{'event':'transaction_prepared','original_os':'Android','restore':False})
         self.event('failed','transition',{'event':label,'preserve_originals':True})
 
+    def fresh_couch_session(self, bound, snapshot_says_none=True):
+        """Reshape the fixture into a reinstall without a saved Android enrollment."""
+        self.record['android_identity']=None;self.record.pop('android_enrollment',None)
+        if snapshot_says_none:self.record['android_enrollment']='none'
+        raw=json.dumps(self.record).encode();(self.source/'current-couch-snapshot.json').write_bytes(raw)
+        for old in self.source.glob('event-*.json'):old.unlink()
+        self.events=[]
+        self.event('created','created',{})
+        self.event('inputs_verified','transition',{'event':'inputs_verified','stage_sha256':self.stage})
+        self.event('inputs_verified','checkpoint',{'event':'reinstall_without_android_enrollment','android_enrollment':'none'})
+        self.event('inputs_verified','checkpoint',{'event':'couch_serial_identity','result':'observed','cid':self.record['cid'],'boot_flag':'clear'})
+        for name,item in sorted(self.record['originals'].items()):self.event('inputs_verified','checkpoint',{'event':'bootstrap_original_verified','target':name,**item})
+        self.event('inputs_verified','checkpoint',{'event':'couch_boot_verified','evidence':'couch-boot-image+couch-recovery-image+mediatek-overlay'})
+        self.event('android_bound','transition',{'event':'couch_device_bound','original_os':'Couch','android_enrollment':'none',
+                                                 'cid_source':'serial_and_download_agent','restore_available':False,**bound})
+        self.event('originals_saved','transition',{'event':'enrollment_complete','enrollment_sha256':recovery.sha(raw)})
+        self.event('stage_boot_pending','transition',{'event':'bootstrap_write_admitted','stage_sha256':self.stage})
+        self.event('stage_boot_pending','checkpoint',{'event':'bootstrap_readback_verified','stage_sha256':self.stage})
+        self.event('failed','transition',{'event':'installation_stopped','preserve_originals':True})
+
+    def test_reinstall_without_android_enrollment_is_admitted_like_a_retained_reinstall(self):
+        self.fresh_couch_session({'cid':self.record['cid']})
+        proof=self.admit()
+        self.assertEqual(proof.record['original_os'],'Couch')
+        self.assertIn('current-couch-snapshot.json',proof.evidence_sha256)
+        device=self.device()
+        result=recovery.recover(proof,device,lambda *a:device,self.root/'recovery')
+        self.assertEqual(result['restored'],['boot']);self.assertEqual(device.writes,['boot'])
+        self.assertEqual(device.hashes['boot'],self.record['originals']['boot']['sha256'])
+
+    def test_reinstall_without_android_enrollment_binding_must_match_its_snapshot(self):
+        for bound in ({'cid':'2'*32}, {'cid':self.record['cid'],'original_os':'Android'},
+                      {'cid':self.record['cid'],'android_enrollment':'imported'}):
+            self.fresh_couch_session(bound)
+            with self.assertRaisesRegex(InstallError,'Couch binding mismatch'):self.admit()
+        # The binding needs the snapshot to say there is no Android enrollment too.
+        self.fresh_couch_session({'cid':self.record['cid']},snapshot_says_none=False)
+        with self.assertRaisesRegex(InstallError,'Couch binding mismatch'):self.admit()
+
     def test_fresh_android_session_stopped_by_the_stage_restores_android_boot(self):
         self.android_session()
         proof=self.admit()

@@ -785,6 +785,10 @@ fn install(
         None
     };
     let fresh = enrollment == Some(EnrollmentChoice::WithoutEnrollment);
+    let chosen_folder = match &enrollment {
+        Some(EnrollmentChoice::Folder(source)) => Some(source.clone()),
+        _ => None,
+    };
     let (saved, serial, expected_cid, identity) = if let Some(EnrollmentChoice::Folder(source)) =
         enrollment
     {
@@ -807,8 +811,6 @@ fn install(
                 },
             )?
         };
-        // Only now, past full admission, is the folder worth offering again.
-        enrollment_sources::remember(&state_root, &source);
         let cid = imported.record().cid.clone();
         let identity = serde_json::to_value(&imported.record().android_identity)?;
         (Some(imported), None, Some(cid), identity)
@@ -1034,6 +1036,12 @@ fn install(
             retained_sha256: originals.clone(),
         };
         let proof = saved.rebind_mode(&observation, session, restore)?;
+        // Only now, imported in full and bound to this remote, is the folder
+        // worth offering first next time. A folder that fails the rebind is
+        // not remembered, so it cannot keep coming back at the top.
+        if let Some(source) = &chosen_folder {
+            enrollment_sources::remember(&state_root, source);
+        }
         session.transition(Phase::AndroidBound,&json!({"event":"retained_enrollment_bound","cid":cid,"original_os":"Couch","enrollment_sha256":proof.enrollment().sha256(),"usb":bound,"restore":restore}))?;
         Some(proof)
     } else if fresh {

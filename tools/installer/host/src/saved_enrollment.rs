@@ -155,7 +155,8 @@ impl SavedEnrollment {
         );
         ensure!(
             observed.identity_sha256 == self.record.identity_sha256,
-            "live calibration partitions differ from the retained enrollment"
+            "live calibration partitions differ from the retained enrollment ({})",
+            calibration_difference(&observed.identity_sha256, &self.record.identity_sha256)
         );
         if !restore {
             ensure!(
@@ -174,6 +175,95 @@ impl SavedEnrollment {
         )?;
         Ok(BoundEnrollment { saved: self })
     }
+}
+impl SavedEnrollment {
+    /// The calibration areas that changed, when that is the only thing that
+    /// differs from the live hardware identity: same chip, CID encoding, CID
+    /// and capacity. Android started again after the enrollment was saved
+    /// changes nvdata and the protect areas this way. `None` for anything else.
+    /// Call before `rebind_mode`, which consumes the enrollment.
+    pub fn calibration_only_mismatch(&self, observed: &ObservedHardware) -> Option<Vec<String>> {
+        let same_remote = observed.hwcode == 0x6580
+            && observed.cid_encoding == "mt6580-legacy-le32-registers"
+            && observed.cid == self.record.cid
+            && observed.capacity == self.record.capacity;
+        let changed = changed_calibration(&observed.identity_sha256, &self.record.identity_sha256);
+        (same_remote && !changed.is_empty()).then_some(changed)
+    }
+}
+/// Calibration areas whose digest differs, in name order.
+fn changed_calibration(
+    live: &BTreeMap<String, String>,
+    saved: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut names: Vec<_> = IDENTITY.to_vec();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .filter(|name| live.get(*name) != saved.get(*name))
+        .map(String::from)
+        .collect()
+}
+/// "nvdata, protect1, protect2 changed; nvram, proinfo unchanged".
+fn calibration_difference(
+    live: &BTreeMap<String, String>,
+    saved: &BTreeMap<String, String>,
+) -> String {
+    describe_calibration_change(&changed_calibration(live, saved))
+}
+/// The same wording from a list of changed areas.
+pub fn describe_calibration_change(changed: &[String]) -> String {
+    let mut unchanged: Vec<_> = IDENTITY
+        .into_iter()
+        .filter(|name| !changed.iter().any(|other| other == name))
+        .collect();
+    unchanged.sort_unstable();
+    if unchanged.is_empty() {
+        format!("{} changed", changed.join(", "))
+    } else {
+        format!(
+            "{} changed; {} unchanged",
+            changed.join(", "),
+            unchanged.join(", ")
+        )
+    }
+}
+/// What a saved native enrollment folder claims about its remote, read
+/// without verifying its journal or backups. Only for pointing the operator
+/// at a folder that may match; it never admits one, and whatever is picked is
+/// imported and checked in full.
+pub struct Peek {
+    pub cid: String,
+    pub capacity: u64,
+    pub identity_sha256: BTreeMap<String, String>,
+    pub partitions: BTreeMap<String, Region>,
+    pub odmdtbo_sha256: String,
+}
+impl Peek {
+    /// Whether this folder would pass `rebind_mode` against `observed` as
+    /// far as its record says: the same CID, capacity and calibration, and,
+    /// unless restoring, the same layout and overlay. Its files are not
+    /// checked here; that is what the import does.
+    pub fn matches(&self, observed: &ObservedHardware, restore: bool) -> bool {
+        self.cid == observed.cid
+            && self.capacity == observed.capacity
+            && self.identity_sha256 == observed.identity_sha256
+            && (restore
+                || (self.partitions == observed.partitions
+                    && observed.retained_sha256.get("odmdtbo") == Some(&self.odmdtbo_sha256)))
+    }
+}
+pub fn peek(source: &Path) -> Option<Peek> {
+    let bytes = read(&source.join("enrollment.json"), 65536).ok()?;
+    let record: Record = serde_json::from_slice(&bytes).ok()?;
+    validate(&record).ok()?;
+    Some(Peek {
+        odmdtbo_sha256: record.originals.get("odmdtbo")?.sha256.clone(),
+        cid: record.cid,
+        capacity: record.capacity,
+        identity_sha256: record.identity_sha256,
+        partitions: record.partitions,
+    })
 }
 impl BoundEnrollment {
     pub fn enrollment(&self) -> &SavedEnrollment {
@@ -622,6 +712,121 @@ mod tests {
             };
             assert_eq!(saved.rebind(&live, &mut session).is_ok(), changed == 0);
             assert_eq!(session.phase(), Phase::Created);
+        }
+    }
+    #[test]
+    fn a_calibration_mismatch_names_the_changed_areas() {
+        let root = private_root();
+        let mut session = SessionGuard::create(&root.path().join("new")).unwrap();
+        let record = record();
+        let mut live = observed(&record);
+        for name in ["nvdata", "protect1", "protect2"] {
+            live.identity_sha256.insert(name.into(), "b".repeat(64));
+        }
+        let saved = SavedEnrollment {
+            retained_sha256: BTreeMap::new(),
+            record: record.clone(),
+            root: root.path().join("saved"),
+            sha256: "a".repeat(64),
+            provenance: "fixture",
+        };
+        assert_eq!(
+            saved.calibration_only_mismatch(&live),
+            Some(vec!["nvdata".into(), "protect1".into(), "protect2".into()])
+        );
+        let error = saved.rebind(&live, &mut session).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "live calibration partitions differ from the retained enrollment (nvdata, protect1, \
+             protect2 changed; nvram, proinfo unchanged)"
+        );
+        let all: BTreeMap<_, _> = IDENTITY
+            .into_iter()
+            .map(|name| (name.to_string(), "c".repeat(64)))
+            .collect();
+        assert_eq!(
+            calibration_difference(&all, &record.identity_sha256),
+            "nvdata, nvram, proinfo, protect1, protect2 changed"
+        );
+    }
+    #[test]
+    fn a_calibration_only_mismatch_is_reported_only_for_the_same_remote() {
+        let record = record();
+        let saved = SavedEnrollment {
+            retained_sha256: BTreeMap::new(),
+            record: record.clone(),
+            root: PathBuf::from("saved"),
+            sha256: "a".repeat(64),
+            provenance: "fixture",
+        };
+        assert_eq!(saved.calibration_only_mismatch(&observed(&record)), None);
+        for change in 0..3 {
+            let mut live = observed(&record);
+            live.identity_sha256.insert("nvdata".into(), "b".repeat(64));
+            match change {
+                0 => live.cid = "34".repeat(16),
+                1 => live.capacity += 512,
+                _ => live.hwcode = 0x6582,
+            }
+            assert_eq!(saved.calibration_only_mismatch(&live), None);
+        }
+    }
+    #[test]
+    fn peek_reads_what_a_native_folder_claims_without_admitting_it() {
+        let root = private_root();
+        let folder = root.path().join("install-aaaa");
+        fs::create_dir(&folder).unwrap();
+        assert!(peek(&folder).is_none());
+        let record = record();
+        let bytes = serde_json::to_vec(&record).unwrap();
+        fs::write(folder.join("enrollment.json"), &bytes).unwrap();
+        let found = peek(&folder).unwrap();
+        assert_eq!(found.cid, record.cid);
+        assert_eq!(found.capacity, record.capacity);
+        assert_eq!(found.identity_sha256, record.identity_sha256);
+        assert_eq!(found.partitions, record.partitions);
+        assert_eq!(found.odmdtbo_sha256, record.originals["odmdtbo"].sha256);
+        // It matches the way rebind_mode does: layout and overlay count
+        // except for a restore.
+        let live = observed(&record);
+        assert!(found.matches(&live, false));
+        let mut moved = observed(&record);
+        moved.partitions.get_mut("boot").unwrap().size += 4096;
+        assert!(!found.matches(&moved, false));
+        assert!(found.matches(&moved, true));
+        let mut overlay = observed(&record);
+        overlay
+            .retained_sha256
+            .insert("odmdtbo".into(), "b".repeat(64));
+        assert!(!found.matches(&overlay, false));
+        assert!(found.matches(&overlay, true));
+        let mut calibration = observed(&record);
+        calibration
+            .identity_sha256
+            .insert("nvdata".into(), "b".repeat(64));
+        assert!(!found.matches(&calibration, true));
+        let mut couch = record.clone();
+        couch.original_os = "Couch".into();
+        fs::write(
+            folder.join("enrollment.json"),
+            serde_json::to_vec(&couch).unwrap(),
+        )
+        .unwrap();
+        assert!(peek(&folder).is_none());
+        fs::write(folder.join("enrollment.json"), b"not json").unwrap();
+        assert!(peek(&folder).is_none());
+        // Too large to be a record, or not a plain file: nothing is read.
+        let mut padded = bytes.clone();
+        padded.resize(70_000, b' ');
+        fs::write(folder.join("enrollment.json"), padded).unwrap();
+        assert!(peek(&folder).is_none());
+        #[cfg(unix)]
+        {
+            let elsewhere = root.path().join("real.json");
+            fs::write(&elsewhere, &bytes).unwrap();
+            fs::remove_file(folder.join("enrollment.json")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, folder.join("enrollment.json")).unwrap();
+            assert!(peek(&folder).is_none());
         }
     }
     #[test]

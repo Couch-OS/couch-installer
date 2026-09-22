@@ -337,7 +337,7 @@ fn enrollment_source(
         } else {
             let mut options: Vec<Choice> = candidates
                 .iter()
-                .map(|found| choice(&found.path.display().to_string(), found.detail()))
+                .map(|found| choice(&found.label(), &found.detail()))
                 .collect();
             options.push(choice("Enter a folder path", "Type the location yourself."));
             if offer_fresh {
@@ -476,6 +476,43 @@ fn download_agent_cid(expected: Option<&str>, observed: &str, fresh: bool) -> Re
             ensure!(fresh, "missing enrolled CID");
             Ok("download_agent")
         }
+    }
+}
+/// After a calibration-only mismatch, the other saved enrollments on this
+/// computer for the same remote, and whether each matches it as it is now.
+/// Read without verification and shown as hints only: whichever the operator
+/// picks next time is imported and checked in full.
+fn same_remote_hints(
+    others: &[(String, saved_enrollment::Peek)],
+    observed: &saved_enrollment::ObservedHardware,
+    restore: bool,
+) -> String {
+    let same: Vec<_> = others
+        .iter()
+        .filter(|(_, peek)| peek.cid == observed.cid)
+        .map(|(label, peek)| {
+            format!(
+                "{label} ({})",
+                if peek.matches(observed, restore) {
+                    "matches this remote now"
+                } else {
+                    "does not match"
+                }
+            )
+        })
+        .collect();
+    // No trailing full stop: the caller's error gets one appended.
+    if same.is_empty() {
+        "No other saved enrollment on this computer is for this remote. A folder with a \
+         different storage ID belongs to another remote"
+            .into()
+    } else {
+        format!(
+            "Other saved enrollments for this remote on this computer: {}. Run the installer \
+             again and pick one that matches this remote now; it is checked again in full. A \
+             folder with a different storage ID belongs to another remote",
+            same.join("; ")
+        )
     }
 }
 /// The remote in download mode is not the one the serial query bound.
@@ -785,6 +822,10 @@ fn install(
         None
     };
     let fresh = enrollment == Some(EnrollmentChoice::WithoutEnrollment);
+    let chosen_folder = match &enrollment {
+        Some(EnrollmentChoice::Folder(source)) => Some(source.clone()),
+        _ => None,
+    };
     let (saved, serial, expected_cid, identity) = if let Some(EnrollmentChoice::Folder(source)) =
         enrollment
     {
@@ -807,8 +848,6 @@ fn install(
                 },
             )?
         };
-        // Only now, past full admission, is the folder worth offering again.
-        enrollment_sources::remember(&state_root, &source);
         let cid = imported.record().cid.clone();
         let identity = serde_json::to_value(&imported.record().android_identity)?;
         (Some(imported), None, Some(cid), identity)
@@ -1033,7 +1072,54 @@ fn install(
                 .collect(),
             retained_sha256: originals.clone(),
         };
-        let proof = saved.rebind_mode(&observation, session, restore)?;
+        let changed = saved.calibration_only_mismatch(&observation);
+        let rejected = saved.sha256().to_owned();
+        let proof = match saved.rebind_mode(&observation, session, restore) {
+            Ok(proof) => proof,
+            Err(error) => {
+                // The remote is left in download mode. When only calibration
+                // changed (Android started again after the folder was saved),
+                // say so plainly and point at any other folder for this
+                // remote that matches it now.
+                const OFF: &str = "Nothing was written. Hold the side Power button until the \
+                     remote turns off, then start it again";
+                let Some(changed) = &changed else {
+                    anyhow::bail!("{error:#}. {OFF}");
+                };
+                // A journal that cannot record the rejection must not hide it.
+                let journal = session.checkpoint(&json!({"event":"imported_enrollment_rejected","enrollment_sha256":rejected,"calibration_changed":changed}));
+                let others: Vec<_> = enrollment_sources::discover(&state_root, None)
+                    .into_iter()
+                    .filter(|candidate| {
+                        chosen_folder
+                            .as_deref()
+                            .is_none_or(|picked| !enrollment_sources::same(&candidate.path, picked))
+                    })
+                    .filter_map(|candidate| {
+                        Some((candidate.label(), saved_enrollment::peek(&candidate.path)?))
+                    })
+                    .collect();
+                let mut message = format!(
+                    "The saved enrollment you picked no longer matches this remote: its \
+                     calibration has changed since it was saved ({}), which happens when Android \
+                     was started again after it was saved. {OFF}. {}",
+                    saved_enrollment::describe_calibration_change(changed),
+                    same_remote_hints(&others, &observation, restore)
+                );
+                if let Err(journal) = journal {
+                    message.push_str(&format!(
+                        ". The installation journal could not record this: {journal:#}"
+                    ));
+                }
+                anyhow::bail!("{message}");
+            }
+        };
+        // Only now, imported in full and bound to this remote, is the folder
+        // worth offering first next time. A folder that fails the rebind is
+        // not remembered, so it cannot keep coming back at the top.
+        if let Some(source) = &chosen_folder {
+            enrollment_sources::remember(&state_root, source);
+        }
         session.transition(Phase::AndroidBound,&json!({"event":"retained_enrollment_bound","cid":cid,"original_os":"Couch","enrollment_sha256":proof.enrollment().sha256(),"usb":bound,"restore":restore}))?;
         Some(proof)
     } else if fresh {
@@ -1445,7 +1531,7 @@ mod tests {
             options[1..],
             ["Enter a folder path", "I don't have a saved enrollment"]
         );
-        assert_eq!(options[0], folder.display().to_string());
+        assert!(options[0].ends_with(" · install-aaaa"), "{}", options[0]);
         let (mut ui, _) = terminal(&["2", "0"]);
         assert_eq!(
             enrollment_source(&mut ui, root.path(), true, false).unwrap(),
@@ -1510,6 +1596,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_stale_enrollment_points_at_the_saved_one_that_matches_this_remote_now() {
+        let cid = "12".repeat(16);
+        let calibration = |value: &str| -> BTreeMap<String, String> {
+            enrollment::IDENTITY
+                .into_iter()
+                .map(|name| (name.to_string(), value.repeat(64)))
+                .collect()
+        };
+        let layout = |size: u64| {
+            BTreeMap::from([(
+                "boot".to_string(),
+                saved_enrollment::Region { offset: 0, size },
+            )])
+        };
+        let observed = saved_enrollment::ObservedHardware {
+            cid: cid.clone(),
+            capacity: 4096,
+            hwcode: 0x6580,
+            cid_encoding: "mt6580-legacy-le32-registers".into(),
+            partitions: layout(512),
+            identity_sha256: calibration("b"),
+            retained_sha256: BTreeMap::from([("odmdtbo".to_string(), "d".repeat(64))]),
+        };
+        let peek = |cid: &str, value: &str, size: u64, overlay: &str| saved_enrollment::Peek {
+            cid: cid.into(),
+            capacity: 4096,
+            identity_sha256: calibration(value),
+            partitions: layout(size),
+            odmdtbo_sha256: overlay.repeat(64),
+        };
+        let others = vec![
+            (
+                "Saved 2026-09-13 06:50 UTC · install-a2ba".to_string(),
+                peek(&cid, "b", 512, "d"),
+            ),
+            (
+                "Saved 2026-09-12 22:10 UTC · install-05f5".to_string(),
+                peek(&cid, "a", 512, "d"),
+            ),
+            (
+                "Saved 2026-09-11 09:00 UTC · install-0b0b".to_string(),
+                peek(&cid, "b", 1024, "d"),
+            ),
+            (
+                "Saved 2026-09-10 09:00 UTC · install-0d0d".to_string(),
+                peek(&cid, "b", 512, "e"),
+            ),
+            (
+                "Saved 2026-09-01 10:00 UTC · install-9999".to_string(),
+                peek(&"34".repeat(16), "b", 512, "d"),
+            ),
+        ];
+        let hints = same_remote_hints(&others, &observed, false);
+        assert!(
+            hints.contains("install-a2ba (matches this remote now)"),
+            "{hints}"
+        );
+        assert!(hints.contains("install-05f5 (does not match)"), "{hints}");
+        // Layout and overlay count, as they do for the rebind itself ...
+        assert!(hints.contains("install-0b0b (does not match)"), "{hints}");
+        assert!(hints.contains("install-0d0d (does not match)"), "{hints}");
+        // ... except for a restore, which does not compare them.
+        let restoring = same_remote_hints(&others, &observed, true);
+        assert!(
+            restoring.contains("install-0b0b (matches this remote now)"),
+            "{restoring}"
+        );
+        assert!(
+            restoring.contains("install-0d0d (matches this remote now)"),
+            "{restoring}"
+        );
+        assert!(!hints.contains("install-9999"), "{hints}");
+        assert!(hints.contains("belongs to another remote"));
+        assert!(!hints.ends_with('.'));
+        let none = same_remote_hints(&others[4..], &observed, false);
+        assert!(none.starts_with("No other saved enrollment on this computer is for this remote"));
+        assert!(!none.ends_with('.'));
+    }
     #[test]
     fn a_remote_left_in_download_mode_is_told_to_power_off() {
         let couch = json!({"bus":1,"address":5,"ports":[4],"vid":0x0e8d,"pid":0x201c});

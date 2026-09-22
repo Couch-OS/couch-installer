@@ -10,11 +10,17 @@
 //! digest, it cannot claim that a folder is unchanged since a previous import,
 //! and it can never stand in for validation. Anything offered here is verified
 //! again, in full, before it is used.
+//!
+//! Candidates are listed newest first by the date of their `enrollment.json`,
+//! so the enrollment saved last, which is the one most likely to still match a
+//! remote whose Android was started again, is at the top. Session folder names
+//! are random and say nothing about age.
 use serde_json::json;
 use std::{
-    collections::BTreeSet,
+    cmp::Ordering,
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// How a candidate was found.
@@ -30,23 +36,79 @@ pub enum Origin {
 pub struct Candidate {
     pub path: PathBuf,
     pub origin: Origin,
+    /// When its `enrollment.json` was last written, as the file system records
+    /// it. A copied folder carries its copy time. `None` for an older verified
+    /// Python export, which has no such file, or when the date is unreadable.
+    pub saved: Option<SystemTime>,
+    /// An older verified Python export rather than a native session.
+    pub legacy: bool,
 }
 
 impl Candidate {
-    /// Menu wording. It describes what was observed structurally and states
-    /// that verification still happens, so nothing here reads as a trust claim.
-    pub fn detail(&self) -> &'static str {
-        match self.origin {
-            Origin::Remembered => "Used for a previous verified import. Checked again in full now.",
-            Origin::Native => {
-                "Installer session containing enrollment.json. Checked again in full now."
-            }
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.display().to_string())
+    }
+    /// Menu label: when the enrollment was saved, and which folder it is.
+    pub fn label(&self) -> String {
+        match (self.legacy, self.saved) {
+            (true, _) => format!("Older verified backup · {}", self.name()),
+            (false, Some(saved)) => format!("Saved {} · {}", utc_minute(saved), self.name()),
+            (false, None) => format!("Saved at an unknown time · {}", self.name()),
         }
     }
+    /// Menu wording. It describes what was observed structurally and states
+    /// that verification still happens, so nothing here reads as a trust claim.
+    /// Nothing about the remote is known yet when this is shown, so it names no
+    /// storage ID.
+    pub fn detail(&self) -> String {
+        format!(
+            "Folder {}. {}Checked again in full now.",
+            self.path.display(),
+            if self.origin == Origin::Remembered {
+                "Used last time. "
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+/// A file date as a UTC minute, for example `2026-09-13 06:50 UTC`.
+pub fn utc_minute(time: SystemTime) -> String {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let (days, rest) = ((seconds / 86_400) as i64, seconds % 86_400);
+    // Proleptic Gregorian civil date from days since 1970-01-01.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rest / 3600,
+        rest % 3600 / 60
+    )
 }
 
 const RECORD: &str = "enrollment-source.json";
 const RECORD_LIMIT: u64 = 8192;
+/// `enrollment.json` is dated only when it is a plain file of a plausible size.
+const ENROLLMENT_LIMIT: u64 = 64 * 1024;
 const SESSION_PREFIX: &str = "install-";
 /// Upper bound on offered candidates. `Ui::choose` rejects a list longer than
 /// 128 options outright, and that rejection is a hard error that would strand
@@ -54,15 +116,14 @@ const SESSION_PREFIX: &str = "install-";
 /// limit keeps the menu readable and keeps manual entry reachable no matter
 /// how many sessions have accumulated.
 const MENU_LIMIT: usize = 32;
-/// One extra native path preserves a full menu when the remembered entry is
-/// also one of the native sessions. The set is sorted and bounded while the
-/// directory is scanned, so unrelated state files cannot influence which
-/// sessions are offered or make retained candidate memory unbounded.
+/// Sessions kept while the directory is scanned: the newest ones, so unrelated
+/// state files cannot influence which sessions are offered or make retained
+/// candidate memory unbounded.
 const NATIVE_CANDIDATE_LIMIT: usize = MENU_LIMIT + 1;
 
 /// Treat two spellings of one folder as the same entry where the filesystem
 /// can confirm it. Falls back to a literal comparison when it cannot.
-fn same(left: &Path, right: &Path) -> bool {
+pub fn same(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => left == right,
@@ -82,6 +143,34 @@ fn couch_snapshot(dir: &Path) -> bool {
 
 fn native_enrollment(dir: &Path) -> bool {
     dir.join("enrollment.json").is_file() && !couch_snapshot(dir)
+}
+
+/// An older verified Python export: it has no enrollment.json, but carries
+/// the bootstrap journal its import requires.
+fn legacy_export(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join("bootstrap").join("journal.json"))
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+/// The date of a folder's `enrollment.json`, read from its metadata only.
+fn saved_at(dir: &Path) -> Option<SystemTime> {
+    let metadata = fs::symlink_metadata(dir.join("enrollment.json")).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > ENROLLMENT_LIMIT {
+        return None;
+    }
+    metadata.modified().ok()
+}
+
+/// Newest first; undated last; ties by path, so the order never depends on
+/// the order the directory happens to list its entries in.
+fn newest_first(left: &Candidate, right: &Candidate) -> Ordering {
+    match (left.saved, right.saved) {
+        (Some(a), Some(b)) => b.cmp(&a),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+    .then_with(|| left.path.cmp(&right.path))
 }
 
 /// Read the remembered path. Returns `None` for a missing, oversized,
@@ -106,27 +195,39 @@ pub fn remembered(state_root: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(recorded))
 }
 
-/// Candidates to offer, remembered entry first, then installer sessions in a
-/// deterministic order. An empty result means the caller should fall back to
-/// the manual prompt.
+/// Candidates to offer, newest first. A remembered native folder is dated and
+/// placed like any other, and marked as used last time. A remembered older
+/// Python export has no `enrollment.json` to date it by, so it stays first.
+/// An empty result means the caller should fall back to the manual prompt.
 ///
-/// The list is capped at `MENU_LIMIT`. Manual entry stays reachable, so a cap
-/// costs an operator a scroll rather than a route to the folder they wanted.
+/// The list is capped at `MENU_LIMIT`, keeping the newest. Manual entry stays
+/// reachable, so a cap costs an operator a scroll rather than a route to the
+/// folder they wanted.
 pub fn discover(state_root: &Path, remembered: Option<PathBuf>) -> Vec<Candidate> {
     let mut found = Vec::new();
-    if let Some(path) = remembered {
+    let mut sessions: Vec<Candidate> = Vec::new();
+    if let Some(path) = &remembered {
         // The Couch-snapshot exclusion applies here too. A remembered entry is
-        // not re-checked for enrollment.json, because a legacy Python export
+        // not required to hold enrollment.json, because a legacy Python export
         // legitimately lacks one, but a folder that has become a Couch
         // reinstall record is never an Android enrollment.
-        if path.is_dir() && !couch_snapshot(&path) {
-            found.push(Candidate {
-                path,
+        if path.is_dir() && !couch_snapshot(path) {
+            let native = native_enrollment(path);
+            // A remembered session that has lost its enrollment.json is not
+            // an older export, whatever else it holds; it is offered undated.
+            let candidate = Candidate {
+                path: path.clone(),
                 origin: Origin::Remembered,
-            });
+                saved: if native { saved_at(path) } else { None },
+                legacy: !native && legacy_export(path),
+            };
+            if native {
+                sessions.push(candidate);
+            } else {
+                found.push(candidate);
+            }
         }
     }
-    let mut sessions = BTreeSet::new();
     if let Ok(entries) = fs::read_dir(state_root) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -134,32 +235,35 @@ pub fn discover(state_root: &Path, remembered: Option<PathBuf>) -> Vec<Candidate
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(SESSION_PREFIX));
-            if named && native_enrollment(&path) {
-                sessions.insert(path);
-                if sessions.len() > NATIVE_CANDIDATE_LIMIT {
-                    // Keep the lexically earliest entries, which is the same
-                    // deterministic ordering shown to the operator below.
-                    sessions.pop_last();
-                }
+            if !named || !native_enrollment(&path) {
+                continue;
+            }
+            if remembered
+                .as_deref()
+                .is_some_and(|other| same(other, &path))
+            {
+                continue;
+            }
+            sessions.push(Candidate {
+                saved: saved_at(&path),
+                path,
+                origin: Origin::Native,
+                legacy: false,
+            });
+            if sessions.len() > NATIVE_CANDIDATE_LIMIT {
+                sessions.sort_by(newest_first);
+                sessions.truncate(NATIVE_CANDIDATE_LIMIT);
             }
         }
     }
-    for path in sessions {
-        if found.len() >= MENU_LIMIT {
-            break;
-        }
-        if !found.iter().any(|other| same(&other.path, &path)) {
-            found.push(Candidate {
-                path,
-                origin: Origin::Native,
-            });
-        }
-    }
+    sessions.sort_by(newest_first);
+    let room = MENU_LIMIT.saturating_sub(found.len());
+    found.extend(sessions.into_iter().take(room));
     found
 }
 
-/// Record the folder just imported. Call only after a fully successful,
-/// fully validated import.
+/// Record the folder just bound. Call only after a fully successful import
+/// and a successful rebind against the live remote.
 ///
 /// Path only: no digest, no copied record fields, nothing that could later be
 /// mistaken for evidence. Best effort by design, because failing to write a
@@ -212,6 +316,26 @@ mod tests {
         dir
     }
 
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+    }
+
+    /// A native session whose enrollment.json was saved at `seconds`.
+    fn dated(root: &Path, name: &str, seconds: u64) -> PathBuf {
+        let dir = session(root, name, &["enrollment.json"]);
+        fs::File::options()
+            .write(true)
+            .open(dir.join("enrollment.json"))
+            .unwrap()
+            .set_modified(at(seconds))
+            .unwrap();
+        dir
+    }
+
+    fn paths(found: &[Candidate]) -> Vec<PathBuf> {
+        found.iter().map(|c| c.path.clone()).collect()
+    }
+
     #[test]
     fn no_candidates_leaves_the_operator_at_the_manual_prompt() {
         let root = TempDir::new().unwrap();
@@ -253,16 +377,33 @@ mod tests {
     }
 
     #[test]
-    fn several_sessions_are_all_offered_in_a_deterministic_order() {
+    fn several_sessions_are_offered_newest_first() {
         let root = TempDir::new().unwrap();
-        let second = session(root.path(), "install-bbbb", &["enrollment.json"]);
-        let first = session(root.path(), "install-aaaa", &["enrollment.json"]);
+        // Folder names are random: the lexically first is the oldest here.
+        let oldest = dated(root.path(), "install-aaaa", 1_789_000_000);
+        let newest = dated(root.path(), "install-cccc", 1_789_282_200);
+        let middle = dated(root.path(), "install-bbbb", 1_789_100_000);
         let found = discover(root.path(), None);
-        assert_eq!(
-            found.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
-            vec![first, second]
-        );
+        assert_eq!(paths(&found), vec![newest, middle, oldest]);
+        assert_eq!(found[0].saved, Some(at(1_789_282_200)));
         assert_eq!(discover(root.path(), None), found);
+    }
+
+    #[test]
+    fn equal_or_unreadable_dates_fall_back_to_the_folder_order() {
+        let root = TempDir::new().unwrap();
+        let second = dated(root.path(), "install-bbbb", 1_789_000_000);
+        let first = dated(root.path(), "install-aaaa", 1_789_000_000);
+        let newer = dated(root.path(), "install-zzzz", 1_789_000_001);
+        // An enrollment.json too large to be a record is offered, undated, last.
+        let big = session(root.path(), "install-0000", &[]);
+        fs::write(big.join("enrollment.json"), vec![b' '; 70_000]).unwrap();
+        let found = discover(root.path(), None);
+        assert_eq!(paths(&found), vec![newer, first, second, big]);
+        assert_eq!(found[3].saved, None);
+        assert!(found[3]
+            .label()
+            .starts_with("Saved at an unknown time · install-0000"));
     }
 
     #[test]
@@ -274,16 +415,10 @@ mod tests {
         for n in 0..4097 {
             fs::write(root.path().join(format!("unrelated-{n:04}")), b"").unwrap();
         }
-        let second = session(root.path(), "install-bbbb", &["enrollment.json"]);
-        let first = session(root.path(), "install-aaaa", &["enrollment.json"]);
+        let second = dated(root.path(), "install-bbbb", 1_789_000_000);
+        let first = dated(root.path(), "install-aaaa", 1_789_000_060);
         let found = discover(root.path(), None);
-        assert_eq!(
-            found
-                .iter()
-                .map(|candidate| candidate.path.clone())
-                .collect::<Vec<_>>(),
-            vec![first, second]
-        );
+        assert_eq!(paths(&found), vec![first, second]);
         assert_eq!(discover(root.path(), None), found);
     }
 
@@ -414,25 +549,82 @@ mod tests {
     }
 
     #[test]
-    fn the_capped_list_keeps_the_same_entries_on_every_run() {
+    fn the_capped_list_keeps_the_newest_sessions_on_every_run() {
         let root = TempDir::new().unwrap();
-        for n in 0..200 {
-            session(
+        for n in 0..200u64 {
+            dated(
                 root.path(),
-                &format!("install-{n:04}"),
-                &["enrollment.json"],
+                &format!("install-{:04}", (n * 37) % 200),
+                1_789_000_000 + n,
             );
         }
         let first = discover(root.path(), None);
         assert_eq!(discover(root.path(), None), first);
-        let mut expected: Vec<_> = (0..200)
-            .map(|n| root.path().join(format!("install-{n:04}")))
+        let expected: Vec<_> = (0..200u64)
+            .rev()
+            .take(MENU_LIMIT)
+            .map(|n| root.path().join(format!("install-{:04}", (n * 37) % 200)))
             .collect();
-        expected.sort();
-        expected.truncate(MENU_LIMIT);
+        assert_eq!(paths(&first), expected);
+    }
+
+    #[test]
+    fn a_remembered_session_is_marked_and_placed_by_its_date() {
+        let root = TempDir::new().unwrap();
+        let newer = dated(root.path(), "install-bbbb", 1_789_282_200);
+        let used = dated(root.path(), "install-aaaa", 1_789_000_000);
+        let found = discover(root.path(), Some(used.clone()));
+        assert_eq!(paths(&found), vec![newer, used]);
+        assert_eq!(found[1].origin, Origin::Remembered);
+        assert!(found[1].detail().contains("Used last time."));
+        assert!(!found[0].detail().contains("Used last time."));
+    }
+
+    #[test]
+    fn labels_name_the_date_and_folder_and_details_name_no_storage_id() {
+        let root = TempDir::new().unwrap();
+        let native = dated(root.path(), "install-a2baa68b63cc958a", 1_789_282_200);
+        let elsewhere = TempDir::new().unwrap();
+        let legacy = elsewhere.path().join("python-run");
+        fs::create_dir_all(legacy.join("bootstrap")).unwrap();
+        fs::write(legacy.join("bootstrap/journal.json"), b"{}").unwrap();
+        let found = discover(root.path(), Some(legacy.clone()));
+        assert_eq!(found[0].label(), "Older verified backup · python-run");
         assert_eq!(
-            first.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
-            expected
+            found[1].label(),
+            "Saved 2026-09-13 06:50 UTC · install-a2baa68b63cc958a"
+        );
+        assert_eq!(
+            found[1].detail(),
+            format!("Folder {}. Checked again in full now.", native.display())
+        );
+        assert_eq!(
+            found[0].detail(),
+            format!(
+                "Folder {}. Used last time. Checked again in full now.",
+                legacy.display()
+            )
+        );
+        for candidate in &found {
+            assert!(!candidate.detail().to_lowercase().contains("storage id"));
+        }
+        // A remembered session that lost its enrollment.json is not called an
+        // older backup.
+        let lost = session(root.path(), "install-lost", &[]);
+        let found = discover(root.path(), Some(lost));
+        assert_eq!(found[0].label(), "Saved at an unknown time · install-lost");
+        assert!(found[0].detail().contains("Used last time."));
+    }
+    #[test]
+    fn utc_minute_formats_known_instants() {
+        assert_eq!(utc_minute(at(951_782_400)), "2000-02-29 00:00 UTC");
+        assert_eq!(utc_minute(at(1_789_282_200)), "2026-09-13 06:50 UTC");
+        assert_eq!(utc_minute(at(0)), "1970-01-01 00:00 UTC");
+        assert_eq!(utc_minute(at(4_102_444_799)), "2099-12-31 23:59 UTC");
+        assert_eq!(utc_minute(at(4_102_444_800)), "2100-01-01 00:00 UTC");
+        assert_eq!(
+            utc_minute(UNIX_EPOCH - std::time::Duration::from_secs(5)),
+            "1970-01-01 00:00 UTC"
         );
     }
 

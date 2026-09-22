@@ -2,7 +2,7 @@
 //! the Python worker is restricted to MTK and bounded USB setup transport.
 use crate::{
     adapter::{self, UsbLease, Worker},
-    android, assembly, dependencies, enrollment, enrollment_sources,
+    android, assembly, couch_restart, dependencies, enrollment, enrollment_sources,
     frontend::{Choice, Ui},
     network,
     public_inputs::{self, create, decode, digest, hex},
@@ -111,7 +111,7 @@ pub(crate) fn state_root() -> Result<PathBuf> {
     }
     Ok(path)
 }
-fn simple(
+pub(crate) fn simple(
     worker: &mut Worker,
     command: Value,
     event: &str,
@@ -153,38 +153,24 @@ fn prepared_worker(
     )?;
     Ok(worker)
 }
-/// Ask a running Couch to restart through its USB serial and, when that is
-/// unavailable, have the user do it by hand.
-fn couch_restart(
-    worker: &mut Worker,
-    bound: &Value,
-    expected_cid: &str,
-    session: &mut SessionGuard,
-    ui: &mut Ui,
-) -> Result<()> {
-    ui.progress(
-        1,
-        "Checking Couch identity and requesting USB restart",
-        0,
-        0,
-    )?;
-    let restart = simple(
-        worker,
-        json!({"op":"couch_reboot","candidate":bound,"cid":expected_cid}),
-        "couch_reboot",
-        20,
-        ui,
-        1,
-    ).context("Couch USB identity/restart failed or its delivery is ambiguous; no automatic retry was attempted")?;
-    session.checkpoint(&json!({"event":"couch_restart","usb":bound,"result":restart["result"]}))?;
-    match restart["result"].as_str() {
-        Some("requested") => {}
-        Some("unavailable") => {
-            ui.choose("Restart the selected remote", "USB serial restart is unavailable; no reboot command was sent. Keep USB connected. After Continue, hold the side Power button until the remote turns off, then release it. If needed, hold Power until it starts again.",&[choice("Continue and watch USB","Only the selected physical USB port can be captured.")])?;
-        }
-        _ => anyhow::bail!("Invalid Couch restart result"),
+/// USB product IDs of the MediaTek preloader and download agent.
+const DOWNLOAD_MODE_PIDS: [u64; 6] = [0x0003, 0x6000, 0x2000, 0x2001, 0x20ff, 0x3000];
+/// What to tell someone asked to connect a running Couch when none is found.
+/// A remote still in download mode shows up with a download-mode identity
+/// instead: an earlier attempt stopped after its read-only capture (every
+/// refusal there leaves the download agent running) and it needs a power
+/// cycle before it can start Couch again.
+fn connect_couch_prompt(devices: &[Value]) -> &'static str {
+    if devices.iter().any(|device| {
+        device["pid"]
+            .as_u64()
+            .is_some_and(|pid| DOWNLOAD_MODE_PIDS.contains(&pid))
+    }) {
+        "A remote connected to this computer is still in download mode from an earlier attempt. \
+         If it is yours, hold its side Power button until it turns off, then start it again."
+    } else {
+        "Keep Couch powered on and connected through USB so its physical port can be selected."
     }
-    Ok(())
 }
 /// Wait for the selected physical port to show a download-mode identity, then
 /// start the read-only download-agent session on it. Nothing is written here.
@@ -203,9 +189,9 @@ fn download_mode(worker: &mut Worker, bound: &Value, ui: &mut Ui) -> Result<Valu
             .filter(|d| {
                 d["bus"] == bound["bus"]
                     && d["ports"] == bound["ports"]
-                    && d["pid"].as_u64().is_some_and(|pid| {
-                        [0x0003, 0x6000, 0x2000, 0x2001, 0x20ff, 0x3000].contains(&pid)
-                    })
+                    && d["pid"]
+                        .as_u64()
+                        .is_some_and(|pid| DOWNLOAD_MODE_PIDS.contains(&pid))
             })
             .collect::<Vec<_>>();
         ensure!(found.len() <= 1, "ambiguous selected USB port");
@@ -301,32 +287,202 @@ fn input_path(ui: &mut Ui, title: &str, body: &str) -> Result<PathBuf> {
         Ok(PathBuf::from(value.as_str()))
     }
 }
-fn enrollment_source(ui: &mut Ui, state_root: &Path) -> Result<PathBuf> {
+/// Where the reinstall takes its Android enrollment from.
+#[derive(Debug, PartialEq, Eq)]
+enum EnrollmentChoice {
+    Folder(PathBuf),
+    /// Reinstall from what is on the remote now. Restore stock Android is not
+    /// available for the remote afterwards.
+    WithoutEnrollment,
+}
+/// Pick the saved Android enrollment. With `offer_fresh` (Reinstall, never
+/// Restore) the operator may also continue without one, after confirming what
+/// that gives up; without it this is the unchanged folder picker.
+fn enrollment_source(
+    ui: &mut Ui,
+    state_root: &Path,
+    offer_fresh: bool,
+    skip_userdata: bool,
+) -> Result<EnrollmentChoice> {
     const TITLE: &str = "Saved Android enrollment directory";
     const BODY: &str =
         "Choose the retained native enrollment or older verified Python backup folder.";
     let candidates =
         enrollment_sources::discover(state_root, enrollment_sources::remembered(state_root));
-    if candidates.is_empty() {
-        return input_path(ui, TITLE, BODY);
-    }
-    let mut options: Vec<Choice> = candidates
-        .iter()
-        .map(|found| choice(&found.path.display().to_string(), found.detail()))
-        .collect();
-    options.push(choice("Enter a folder path", "Type the location yourself."));
-    // The manual option is always last, so a single candidate is still an
-    // explicit selection rather than something applied on the operator's behalf.
-    let picked = ui.choose(
-        TITLE,
-        "Confirm which retained enrollment to import, or enter another folder. Whichever you pick is verified in full before use.",
-        &options,
-    )?;
-    match enrollment_sources::resolve(&candidates, picked) {
-        Some(path) => Ok(path),
-        None => input_path(ui, TITLE, BODY),
+    loop {
+        if candidates.is_empty() {
+            if !offer_fresh {
+                return Ok(EnrollmentChoice::Folder(input_path(ui, TITLE, BODY)?));
+            }
+            let picked = ui.choose(
+                "Saved Android enrollment",
+                "No saved Android enrollment was found on this computer. It is the folder the \
+                 first Couch installation on this remote created while the remote still ran \
+                 Android, and it usually lives on the computer that did that installation.",
+                &[
+                    choice(
+                        "Continue without a saved enrollment",
+                        "Reinstall Couch from what is on the remote now. Restore stock Android \
+                         will not be available afterwards.",
+                    ),
+                    choice(
+                        "Enter a folder path",
+                        "Type the location of a copied enrollment folder yourself.",
+                    ),
+                ],
+            )?;
+            if picked == 1 {
+                return Ok(EnrollmentChoice::Folder(input_path(ui, TITLE, BODY)?));
+            }
+        } else {
+            let mut options: Vec<Choice> = candidates
+                .iter()
+                .map(|found| choice(&found.path.display().to_string(), found.detail()))
+                .collect();
+            options.push(choice("Enter a folder path", "Type the location yourself."));
+            if offer_fresh {
+                options.push(choice(
+                    "I don't have a saved enrollment",
+                    "Reinstall Couch without one. Restore stock Android will not be available \
+                     afterwards.",
+                ));
+            }
+            // The manual option always follows the candidates, so a single
+            // candidate is still an explicit selection rather than something
+            // applied on the operator's behalf.
+            let picked = ui.choose(
+                TITLE,
+                "Confirm which retained enrollment to import, or enter another folder. Whichever you pick is verified in full before use.",
+                &options,
+            )?;
+            if !(offer_fresh && picked == candidates.len() + 1) {
+                return Ok(EnrollmentChoice::Folder(match enrollment_sources::resolve(
+                    &candidates,
+                    picked,
+                ) {
+                    Some(path) => path,
+                    None => input_path(ui, TITLE, BODY)?,
+                }));
+            }
+        }
+        if confirm_without_enrollment(ui, skip_userdata)? {
+            return Ok(EnrollmentChoice::WithoutEnrollment);
+        }
     }
 }
+/// What a reinstall without a saved enrollment keeps and gives up. `false`
+/// means go back to the enrollment picker.
+fn confirm_without_enrollment(ui: &mut Ui, skip_userdata: bool) -> Result<bool> {
+    let data = if skip_userdata {
+        "Your current Couch data will not be backed up, as you chose; its current settings and \
+         paired devices will be lost."
+    } else {
+        "Your current Couch data is also backed up, as you chose."
+    };
+    let body = format!(
+        "Couch will be reinstalled using only what is on the remote now.\n\nKept: before \
+         anything is written (except the COUCH RECOVERY flag, and only if you choose to clear \
+         it), the remote's factory calibration (its Wi-Fi and Bluetooth \
+         settings made at the factory) and its current boot, recovery and logo images are saved \
+         to this computer and checked against the remote. The installer never writes \
+         calibration. {data}\n\nGiven up: the saved enrollment is the only copy of the remote's \
+         original Android system. Without it, Restore stock Android will not be available for \
+         this remote.\n\nThis is only for a remote that is running Couch now. If it runs \
+         Android, choose Install with Android backup instead; the installer checks, and stops \
+         before writing anything if it finds Android."
+    );
+    Ok(ui.choose(
+        "Reinstall without a saved enrollment",
+        &body,
+        &[
+            choice(
+                "Reinstall without a saved enrollment",
+                "Continue. Restore stock Android will not be available afterwards.",
+            ),
+            choice(
+                "Go back",
+                "Choose or enter a saved enrollment folder instead.",
+            ),
+        ],
+    )? == 0)
+}
+/// A reinstall without a saved enrollment, after the read-only capture:
+/// the evidence to journal, or the journal reason and message to refuse
+/// with. Every refusal comes with the remote still in download mode, so each
+/// says how to get it out.
+fn couch_images_admission(
+    images: &std::result::Result<
+        crate::android_images::CouchImages,
+        crate::android_images::Refusal,
+    >,
+    skip_userdata: bool,
+) -> std::result::Result<&'static str, (&'static str, &'static str)> {
+    use crate::android_images::Refusal;
+    match images {
+        // An Android remote whose install stopped after the recovery write
+        // looks exactly like this and still holds Android's userdata. Only a
+        // reinstall that backs userdata up first may continue.
+        Ok(images) if images.stage_in_boot && skip_userdata => Err((
+            "stage_without_data_backup",
+            "Your remote's last installation stopped halfway. Nothing was written. Hold the \
+             side Power button until the remote turns off, then run the installer again and \
+             choose Back up current Couch data",
+        )),
+        Ok(images) => Ok(images.evidence),
+        Err(refused @ Refusal::AndroidBoot) => Err((
+            refused.reason(),
+            "This remote is running Android, not Couch, so it cannot be reinstalled without a \
+             saved enrollment. Nothing was written. Hold the side Power button until the remote \
+             turns off, start Android again, then run the installer and choose Install with \
+             Android backup: that keeps the Android enrollment this option cannot",
+        )),
+        Err(refused @ Refusal::AndroidRecovery) => Err((
+            refused.reason(),
+            "This remote still has Android's recovery, so it was last running Android, not \
+             Couch, and it cannot be reinstalled without a saved enrollment. Nothing was \
+             written. Hold the side Power button until the remote turns off, then start it \
+             again. If it starts Android, run the installer and choose Install with Android \
+             backup. If it does not, an earlier installation attempt stopped after writing its \
+             installer to the remote; keep that attempt's folder, which holds the original boot \
+             image, and ask for help",
+        )),
+        Err(refused @ Refusal::Unrecognised(_)) => Err((
+            refused.reason(),
+            "The remote's current boot or recovery image is neither Couch nor Android, so it \
+             cannot be reinstalled without a saved enrollment. Nothing was written. Hold the \
+             side Power button until the remote turns off and ask for help, including the \
+             folder named below",
+        )),
+    }
+}
+/// Which CID the download agent must report, and what the binding then rests
+/// on. `expected` is the enrolled CID, or the one the running Couch reported
+/// over USB before its restart.
+fn download_agent_cid(expected: Option<&str>, observed: &str, fresh: bool) -> Result<&'static str> {
+    match expected {
+        Some(expected) => {
+            ensure!(
+                observed == expected,
+                "{}",
+                if fresh {
+                    OTHER_DOWNLOAD_REMOTE
+                } else {
+                    "Canonical download-agent CID differs from enrollment"
+                }
+            );
+            Ok("serial_and_download_agent")
+        }
+        None => {
+            ensure!(fresh, "missing enrolled CID");
+            Ok("download_agent")
+        }
+    }
+}
+/// The remote in download mode is not the one the serial query bound.
+const OTHER_DOWNLOAD_REMOTE: &str = "The remote in download mode is not the one that was checked \
+     over USB before the restart (its storage ID differs). Nothing was written. Hold the side \
+     Power button until the remote turns off, connect only the remote you want to reinstall and \
+     run the installer again";
 fn identity_input(
     ui: &mut Ui,
     label: &str,
@@ -441,7 +597,7 @@ pub fn run(ui: &mut Ui, config: Option<&Path>, local_payload: Option<&Path>) -> 
     }
     let mode = ui.choose(
         "Install Couch",
-        "For a fresh installation, start Android, enable USB debugging and connect USB. To reinstall Couch, keep it running and have your saved Android enrollment ready.",
+        "For a fresh installation, start Android, enable USB debugging and connect USB. To reinstall Couch, keep Couch running and connect USB; your saved Android enrollment is used if you have one.",
         &[
             choice(
                 "Install with Android backup",
@@ -453,7 +609,7 @@ pub fn run(ui: &mut Ui, config: Option<&Path>, local_payload: Option<&Path>) -> 
             ),
             choice(
                 "Reinstall existing Couch",
-                "Import retained Android enrollment and back up the current Couch installation.",
+                "Keep Couch running. Uses your saved Android enrollment, or starts fresh without one.",
             ),
             choice(
                 "Restore stock Android",
@@ -496,7 +652,7 @@ pub fn run(ui: &mut Ui, config: Option<&Path>, local_payload: Option<&Path>) -> 
     let skip_userdata = if reinstall {
         ui.choose(
             "Current Couch data backup",
-            "The imported Android originals remain separate from this operation's backups.",
+            "Calibration and the current boot, recovery and logo images are always saved first. Also save the current Couch data (settings and paired devices) before it is replaced?",
             &[
                 choice(
                     "Back up current Couch data",
@@ -616,13 +772,22 @@ fn install(
         Some(vendor_transfer::prepare(&prepared)?)
     };
     session.transition(Phase::InputsVerified,&json!({"event":"inputs_verified","release":release.os.version,"installer_version":release.version,"installer_source_commit":release.source_commit,"os_source_commit":release.os.source_commit,"installation_protocol":release.os.installation_protocol,"payload_sha256":release.payload.sha256,"stage_sha256":stage_hash}))?;
-    let (saved, serial, expected_cid, identity) = if reinstall {
-        let state_root = session
-            .path()
-            .parent()
-            .context("session needs a parent")?
-            .to_path_buf();
-        let source = enrollment_source(ui, &state_root)?;
+    let state_root = session
+        .path()
+        .parent()
+        .context("session needs a parent")?
+        .to_path_buf();
+    // Restore writes the saved Android originals back, so it never offers to
+    // continue without them.
+    let enrollment = if reinstall {
+        Some(enrollment_source(ui, &state_root, !restore, skip_userdata)?)
+    } else {
+        None
+    };
+    let fresh = enrollment == Some(EnrollmentChoice::WithoutEnrollment);
+    let (saved, serial, expected_cid, identity) = if let Some(EnrollmentChoice::Folder(source)) =
+        enrollment
+    {
         let imported = if source.join("enrollment.json").is_file() {
             saved_enrollment::import(&source, session)?
         } else {
@@ -646,7 +811,12 @@ fn install(
         enrollment_sources::remember(&state_root, &source);
         let cid = imported.record().cid.clone();
         let identity = serde_json::to_value(&imported.record().android_identity)?;
-        (Some(imported), None, cid, identity)
+        (Some(imported), None, Some(cid), identity)
+    } else if fresh {
+        // Nothing is imported: every value comes from this remote in this
+        // session, and the running Couch's own answer binds its CID.
+        session.checkpoint(&json!({"event":"reinstall_without_android_enrollment","android_enrollment":"none","restore_available_after":false,"skip_userdata_backup":skip_userdata}))?;
+        (None, None, None, Value::Null)
     } else {
         ui.progress(
         1,
@@ -679,12 +849,23 @@ fn install(
             .as_deref()
             .context("Android did not expose a usable eMMC identity; no write is permitted")?;
         let identity = json!({"device_id":identity_input(ui,"Android Device ID",android.device_id,false)?,"wifi_mac":identity_input(ui,"Android Wi-Fi MAC",android.wifi_mac,true)?,"bt_mac":identity_input(ui,"Android Bluetooth MAC",android.bt_mac,true)?});
-        (None, Some(android.serial), cid.to_string(), identity)
+        (None, Some(android.serial), Some(cid.to_string()), identity)
     };
+    ensure!(
+        !(fresh && restore),
+        "Restore needs the saved Android enrollment"
+    );
     dependencies.verify()?;
     let script = adapter::materialize(session)?;
     let session_dir = session.path().to_path_buf();
     let mut worker = prepared_worker(&dependencies, &script, &prepared, &session_dir, ui)?;
+    // Every Couch restart, first attempt and retry, waits until the remote
+    // reports the expected CID and a normal next start. Without a saved
+    // enrollment the remote's first answer is the expected CID.
+    let mut binding = match &expected_cid {
+        Some(cid) => couch_restart::CouchBinding::enrolled(cid),
+        None => couch_restart::CouchBinding::unbound(),
+    };
     let bound = if let Some(serial) = &serial {
         // The ADB server must not hold the remote while the worker reads its
         // USB serial descriptor (issue #89, Windows). Reboot restarts it.
@@ -716,14 +897,22 @@ fn install(
                 ui,
                 1,
             )?;
-            let candidates = result["devices"]
+            let devices = result["devices"]
                 .as_array()
-                .context("invalid USB inventory")?
+                .context("invalid USB inventory")?;
+            let candidates = devices
                 .iter()
                 .filter(|d| d["pid"] == 0x201c)
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
-                ui.choose("Connect the Couch remote", "Keep Couch powered on and connected through USB so its physical port can be selected.",&[choice("Check USB again","No write or reboot has been requested.")])?;
+                ui.choose(
+                    "Connect the Couch remote",
+                    connect_couch_prompt(devices),
+                    &[choice(
+                        "Check USB again",
+                        "No write or reboot has been requested.",
+                    )],
+                )?;
                 continue;
             }
             let options = candidates
@@ -735,10 +924,18 @@ fn install(
                     )
                 })
                 .collect::<Vec<_>>();
-            let selected=ui.choose("Select the connected Couch remote","Its stored CID and calibration must match the imported enrollment before any write.",&options)?;
+            let selected = ui.choose(
+                "Select the connected Couch remote",
+                if fresh {
+                    "Choose the remote that is running Couch now. It is checked over USB before it is restarted, and nothing is written until its storage and calibration have been saved and checked, except the COUCH RECOVERY flag, and only if you choose to clear it."
+                } else {
+                    "Its stored CID and calibration must match the imported enrollment before any write."
+                },
+                &options,
+            )?;
             break candidates[selected].clone();
         };
-        couch_restart(&mut worker, &bound, &expected_cid, session, ui)?;
+        couch_restart::restart(&mut worker, &bound, &mut binding, false, session, ui)?;
         bound
     };
     let mut attempt = 1u32;
@@ -781,16 +978,16 @@ fn install(
             dependencies.verify()?;
             android::reboot(&dependencies.adb, serial)?;
         } else {
-            couch_restart(&mut worker, &bound, &expected_cid, session, ui)?;
+            couch_restart::restart(&mut worker, &bound, &mut binding, true, session, ui)?;
         }
     };
     let cid = connected["cid"]
         .as_str()
         .context("missing observed canonical CID")?;
-    ensure!(
-        cid == expected_cid,
-        "Canonical download-agent CID differs from enrollment"
-    );
+    // Without a saved enrollment the CID read over the serial shell before the
+    // restart binds the remote; where that was unavailable, this download-mode
+    // read on the same physical port is the first observation.
+    let cid_source = download_agent_cid(binding.expected(), cid, fresh)?;
     let device = &connected["device"];
     enrollment::admit_layout(device, cid, &prepared)?;
     let mut required = 256 * 1024 * 1024u64;
@@ -839,13 +1036,33 @@ fn install(
         let proof = saved.rebind_mode(&observation, session, restore)?;
         session.transition(Phase::AndroidBound,&json!({"event":"retained_enrollment_bound","cid":cid,"original_os":"Couch","enrollment_sha256":proof.enrollment().sha256(),"usb":bound,"restore":restore}))?;
         Some(proof)
+    } else if fresh {
+        // Nothing has been written. The remote must positively be running
+        // Couch: Couch's boot and recovery and a MediaTek overlay, exactly as
+        // just captured. Android here would lose its data with no backup.
+        let images = enrollment::couch_originals(session.path(), &originals)?;
+        match couch_images_admission(&images, skip_userdata) {
+            Ok(evidence) => {
+                session.checkpoint(&json!({"event":"couch_boot_verified","evidence":evidence,"boot_sha256":originals["boot"]}))?;
+            }
+            Err((reason, message)) => {
+                let mut evidence = json!({"event":"couch_boot_refused","reason":reason});
+                if let Err(crate::android_images::Refusal::Unrecognised(detail)) = &images {
+                    evidence["detail"] = json!(detail);
+                }
+                session.checkpoint(&evidence)?;
+                anyhow::bail!("{message}");
+            }
+        }
+        session.transition(Phase::AndroidBound,&json!({"event":"couch_device_bound","original_os":"Couch","android_enrollment":"none","cid":cid,"cid_source":cid_source,"usb":bound,"restore_available":false}))?;
+        None
     } else {
         let profile = enrollment::android_originals(session.path())?;
         session.checkpoint(&json!({"event":"android_stock_profile_verified","profile":profile}))?;
         None
     };
     ensure!(
-        imported_proof.is_some() == reinstall,
+        imported_proof.is_some() == (reinstall && !fresh),
         "missing retained enrollment admission"
     );
     if restore {
@@ -906,12 +1123,14 @@ fn install(
     } else {
         "enrollment.json"
     });
-    write(
-        &enrollment_path,
-        &serde_json::to_vec(
-            &json!({"schema":1,"kind":"couch-device-enrollment","model":"sanytron-ha100","cid":cid,"capacity":device["capacity"],"partitions":device["partitions"],"identity_sha256":identity_hashes,"android_identity":identity,"original_os":if reinstall {"Couch"} else {"Android"},"originals":entries}),
-        )?,
-    )?;
+    let mut snapshot = json!({"schema":1,"kind":"couch-device-enrollment","model":"sanytron-ha100","cid":cid,"capacity":device["capacity"],"partitions":device["partitions"],"identity_sha256":identity_hashes,"android_identity":identity,"original_os":if reinstall {"Couch"} else {"Android"},"originals":entries});
+    if fresh {
+        // A live Couch snapshot with no Android enrollment behind it. Import
+        // refuses it on file name, original OS, this unknown field, its journal
+        // and its boot image, so it can never become an Android baseline.
+        snapshot["android_enrollment"] = json!("none");
+    }
+    write(&enrollment_path, &serde_json::to_vec(&snapshot)?)?;
     session.transition(
         Phase::OriginalsSaved,
         &json!({"event":"enrollment_complete","enrollment_sha256":digest(&enrollment_path)?}),
@@ -1108,6 +1327,8 @@ fn install(
         7,
         if restore {
             "Stock Android restored. Check first boot on the remote, then re-enroll from Android before any future Couch install."
+        } else if fresh {
+            "Couch reinstalled and verified. Check that the remote starts normally. This remote has no saved Android enrollment, so Restore stock Android is not available for it. Keep the folder shown on screen: it holds the remote's calibration and its previous Couch copies."
         } else {
             "Installation verified. First normal boot still needs to be checked on the remote."
         },
@@ -1162,5 +1383,240 @@ mod tests {
             result["userdata"]["sha256"],
             format!("{:x}", Sha256::digest(&data))
         );
+    }
+    use crate::couch_restart::tests::terminal;
+
+    fn state_with(sessions: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for name in sessions {
+            fs::create_dir(root.path().join(name)).unwrap();
+            fs::write(root.path().join(name).join("enrollment.json"), b"{}").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn reinstall_without_candidates_offers_fresh_and_confirms_the_trade_off() {
+        let root = state_with(&[]);
+        // Continue, Go back, Continue, Reinstall without a saved enrollment.
+        let (mut ui, screen) = terminal(&["0", "1", "0", "0"]);
+        assert_eq!(
+            enrollment_source(&mut ui, root.path(), true, false).unwrap(),
+            EnrollmentChoice::WithoutEnrollment
+        );
+        let prompts = screen.prompts();
+        assert_eq!(prompts.len(), 4);
+        assert_eq!(prompts[0].0, "Saved Android enrollment");
+        assert_eq!(prompts[0].1, "choice");
+        assert_eq!(
+            prompts[0].3,
+            ["Continue without a saved enrollment", "Enter a folder path"]
+        );
+        assert!(prompts[0]
+            .2
+            .contains("No saved Android enrollment was found"));
+        assert_eq!(prompts[1].0, "Reinstall without a saved enrollment");
+        assert_eq!(
+            prompts[1].3,
+            ["Reinstall without a saved enrollment", "Go back"]
+        );
+        assert_eq!(prompts[2], prompts[0]);
+        assert_eq!(prompts[3], prompts[1]);
+        // Or type a copied folder's location instead.
+        let (mut ui, screen) = terminal(&["1", "/copied/install-a2baa68b63cc958a"]);
+        assert_eq!(
+            enrollment_source(&mut ui, root.path(), true, false).unwrap(),
+            EnrollmentChoice::Folder("/copied/install-a2baa68b63cc958a".into())
+        );
+        assert_eq!(screen.prompts()[1].1, "text");
+    }
+
+    #[test]
+    fn reinstall_picker_with_candidates_appends_fresh_last() {
+        let root = state_with(&["install-aaaa"]);
+        let folder = root.path().join("install-aaaa");
+        let (mut ui, screen) = terminal(&["0"]);
+        assert_eq!(
+            enrollment_source(&mut ui, root.path(), true, false).unwrap(),
+            EnrollmentChoice::Folder(folder.clone())
+        );
+        let options = &screen.prompts()[0].3;
+        assert_eq!(
+            options[1..],
+            ["Enter a folder path", "I don't have a saved enrollment"]
+        );
+        assert_eq!(options[0], folder.display().to_string());
+        let (mut ui, _) = terminal(&["2", "0"]);
+        assert_eq!(
+            enrollment_source(&mut ui, root.path(), true, false).unwrap(),
+            EnrollmentChoice::WithoutEnrollment
+        );
+        // Go back returns to the same picker, where the folder can be chosen.
+        let (mut ui, screen) = terminal(&["2", "1", "0"]);
+        assert_eq!(
+            enrollment_source(&mut ui, root.path(), true, false).unwrap(),
+            EnrollmentChoice::Folder(folder)
+        );
+        let prompts = screen.prompts();
+        assert_eq!(prompts[2], prompts[0]);
+        let (mut ui, _) = terminal(&["1", "/elsewhere"]);
+        assert_eq!(
+            enrollment_source(&mut ui, root.path(), true, false).unwrap(),
+            EnrollmentChoice::Folder("/elsewhere".into())
+        );
+    }
+
+    #[test]
+    fn restore_picker_is_unchanged_and_never_offers_fresh() {
+        let empty = state_with(&[]);
+        let (mut ui, screen) = terminal(&["/saved"]);
+        assert_eq!(
+            enrollment_source(&mut ui, empty.path(), false, false).unwrap(),
+            EnrollmentChoice::Folder("/saved".into())
+        );
+        let prompts = screen.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, "Saved Android enrollment directory");
+        assert_eq!(prompts[0].1, "text");
+        let one = state_with(&["install-aaaa"]);
+        let (mut ui, screen) = terminal(&["1", "/saved"]);
+        assert_eq!(
+            enrollment_source(&mut ui, one.path(), false, false).unwrap(),
+            EnrollmentChoice::Folder("/saved".into())
+        );
+        let options = &screen.prompts()[0].3;
+        assert_eq!(options.len(), 2);
+        assert!(options
+            .iter()
+            .all(|label| !label.contains("without") && !label.contains("don't have")));
+    }
+
+    #[test]
+    fn trade_off_body_follows_the_data_backup_choice() {
+        for (skip, expected) in [
+            (false, "Your current Couch data is also backed up, as you chose."),
+            (
+                true,
+                "Your current Couch data will not be backed up, as you chose; its current settings and paired devices will be lost.",
+            ),
+        ] {
+            let (mut ui, screen) = terminal(&["1"]);
+            assert!(!confirm_without_enrollment(&mut ui, skip).unwrap());
+            let body = &screen.prompts()[0].2;
+            assert!(body.contains(expected), "{body}");
+            assert!(body.contains("Restore stock Android will not be available"));
+            assert!(body.contains("The installer never writes calibration."));
+            assert!(body.contains("choose Install with Android backup instead"));
+        }
+    }
+
+    #[test]
+    fn a_remote_left_in_download_mode_is_told_to_power_off() {
+        let couch = json!({"bus":1,"address":5,"ports":[4],"vid":0x0e8d,"pid":0x201c});
+        let other = json!({"bus":1,"address":6,"ports":[3],"vid":0x05ac,"pid":0x0250});
+        assert!(connect_couch_prompt(&[]).starts_with("Keep Couch powered on"));
+        assert!(
+            connect_couch_prompt(std::slice::from_ref(&other)).starts_with("Keep Couch powered on")
+        );
+        for pid in DOWNLOAD_MODE_PIDS {
+            let mut stuck = couch.clone();
+            stuck["pid"] = json!(pid);
+            let prompt = connect_couch_prompt(&[other.clone(), stuck]);
+            assert!(prompt.contains("still in download mode"), "{pid:#x}");
+            assert!(prompt.starts_with("A remote connected to this computer"));
+            assert!(prompt.contains("hold its side Power button until it turns off"));
+        }
+    }
+
+    #[test]
+    fn every_refusal_after_download_mode_says_how_to_turn_the_remote_off() {
+        use crate::android_images::{CouchImages, Refusal};
+        let couch = |stage_in_boot| {
+            Ok(CouchImages {
+                evidence: if stage_in_boot { "stage" } else { "couch" },
+                stage_in_boot,
+            })
+        };
+        assert_eq!(couch_images_admission(&couch(false), true), Ok("couch"));
+        assert_eq!(couch_images_admission(&couch(false), false), Ok("couch"));
+        // A half-finished install is admitted only with a data backup.
+        assert_eq!(couch_images_admission(&couch(true), false), Ok("stage"));
+        let (reason, halfway) = couch_images_admission(&couch(true), true).unwrap_err();
+        assert_eq!(reason, "stage_without_data_backup");
+        assert!(halfway.starts_with("Your remote's last installation stopped halfway"));
+        assert!(halfway.ends_with("choose Back up current Couch data"));
+        let refused = |refusal| couch_images_admission(&Err(refusal), false).unwrap_err();
+        let (reason, android) = refused(Refusal::AndroidBoot);
+        assert_eq!(reason, "android_boot");
+        assert!(android.starts_with("This remote is running Android"));
+        let (reason, recovery) = refused(Refusal::AndroidRecovery);
+        assert_eq!(reason, "android_recovery");
+        assert!(recovery.contains("Android's recovery"));
+        let (reason, neither) = refused(Refusal::Unrecognised("boot: zeros".into()));
+        assert_eq!(reason, "unrecognised");
+        assert!(neither.contains("neither Couch nor Android"));
+        for message in [halfway, android, recovery, neither, OTHER_DOWNLOAD_REMOTE] {
+            assert!(message.contains("Nothing was written"), "{message}");
+            assert!(
+                message.contains("Hold the side Power button until the remote turns off"),
+                "{message}"
+            );
+            // run() appends ". Keep saved originals…".
+            assert!(!message.ends_with('.'), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_download_agent_must_report_the_cid_the_remote_was_bound_by() {
+        let cid = "12".repeat(16);
+        let other = "34".repeat(16);
+        assert_eq!(
+            download_agent_cid(Some(&cid), &cid, true).unwrap(),
+            "serial_and_download_agent"
+        );
+        assert_eq!(
+            download_agent_cid(None, &cid, true).unwrap(),
+            "download_agent"
+        );
+        assert_eq!(
+            download_agent_cid(Some(&cid), &other, true)
+                .unwrap_err()
+                .to_string(),
+            OTHER_DOWNLOAD_REMOTE
+        );
+        assert_eq!(
+            download_agent_cid(Some(&cid), &other, false)
+                .unwrap_err()
+                .to_string(),
+            "Canonical download-agent CID differs from enrollment"
+        );
+        assert!(download_agent_cid(Some(&cid), &cid, false).is_ok());
+        assert_eq!(
+            download_agent_cid(None, &cid, false)
+                .unwrap_err()
+                .to_string(),
+            "missing enrolled CID"
+        );
+    }
+
+    #[test]
+    fn nothing_is_written_before_the_remote_is_bound() {
+        // A reinstall without a saved enrollment reaches OriginalsSaved, and
+        // with it the boot write, only through the couch_device_bound
+        // transition: the session refuses any shortcut from InputsVerified.
+        let (_root, mut session) = crate::couch_restart::tests::private_session();
+        for phase in [
+            Phase::OriginalsSaved,
+            Phase::StageBootPending,
+            Phase::Writing,
+        ] {
+            assert!(session.transition(phase, &json!({})).is_err());
+        }
+        session
+            .transition(Phase::AndroidBound, &json!({"event":"couch_device_bound"}))
+            .unwrap();
+        session
+            .transition(Phase::OriginalsSaved, &json!({}))
+            .unwrap();
     }
 }

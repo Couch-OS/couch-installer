@@ -120,13 +120,66 @@ for the selected backups is checked before bootstrap. No preloader or LK write
 operation exists in the worker.
 
 Reinstallation imports a [saved enrollment](https://github.com/dangerouslaser/couch/blob/dev/docs/installer-saved-enrollment.md)
-into a new private session. The selected Couch USB port is queried using a
-nonce-framed fixed CID command; only a matching retained CID permits one fixed
-USB reboot. An unavailable serial interface offers manual restart, while a CID
-mismatch or ambiguous reboot stops without retry. Download-mode CID, full layout,
-calibration and retained device-tree identity are checked again before writing.
-Current Couch originals are saved separately and marked Couch; imported Android
-originals are preserved for Android recovery and never replaced by Couch backups.
+into a new private session. Every Couch restart (Reinstall, Restore and a
+reinstall without a saved enrollment, on the first attempt and on every
+download-mode retry) goes through one readiness check in `couch_restart`. A
+read-only, nonce-framed query over the selected port's Couch serial function
+returns the storage CID, the SHA-256 of the first 512 bytes of the boot control
+block (`mmcblk0p10`) and the uptime. Only two block values are legitimate: all
+zeros (the next start is normal) and `boot-recovery` followed by zeros (the next
+start is COUCH RECOVERY); any other value, or a missing tool, reads as unknown.
+The CID must match, and the remote is restarted only once the flag reads clear:
+an armed flag on a remote up for less than 170 s waits until 180 s of uptime
+and asks again, and one still armed after that wait stops at a not-ready screen.
+A flag still armed after 170 s will not clear by itself (the remote is in COUCH
+RECOVERY, or its GUI never became healthy), so the installer offers to clear it.
+The request is journaled first. The worker then re-reads the CID and requires
+exactly the armed block, runs the recovery action's own pre-write probes (the
+HA100 boot command line and the `mmcblk0p10` block device), sends its `dd`
+clear and `od` readback (a host test keeps all these command strings
+identical), and requires a zero readback and a clear digest, at most once per
+worker. Any failure after the write stops without a restart, saying the flag
+may already be clear. The one-shot reboot then restarts the remote straight
+into download mode. An unknown flag first waits until 180 s of uptime (the full
+180 s on a retry without an uptime); an unknown flag after that, or a remote
+that does not answer three queries two seconds apart, needs the user to confirm
+the normal screen has been up for three minutes, and a silent remote is then
+restarted by hand. The unchanged one-shot reboot, which re-reads the CID,
+follows two seconds after the query, since macOS re-enumerates the device when
+libusb releases it. On Windows the query uses the COM port Windows created for
+Couch's serial function, and only one whose reported location matches the
+selected physical port chain exactly (never a port of unknown location);
+anything else falls back to the manual restart. The reboot and the flag clear
+go through libusb only, so on Windows the restart is a manual Power-button
+restart and the clear is not offered until it has been tested on hardware.
+A CID mismatch or ambiguous reboot stops without retry.
+Download-mode CID, full layout, calibration and retained device-tree identity
+are checked again before writing. Current Couch originals are saved separately
+and marked Couch; imported Android originals are preserved for Android recovery
+and never replaced by Couch backups.
+
+Without a saved enrollment, Reinstall can continue from what is on the remote
+now, after a screen that says Restore stock Android will then be unavailable for
+it; Restore never offers this. Nothing is imported. The running Couch's answer
+to the identity query binds its CID, and the download-agent CID on the same
+physical port must match it; when the serial function could not be asked, the
+download-agent CID is the first observation (journaled as `cid_source:
+download_agent`). After the read-only capture and before any write, the captured
+boot and recovery must both be structurally Couch (a gzip cpio ramdisk with
+exactly one root `init` starting `#!/bin/busybox sh`, a root `bin/busybox` and no
+`init.rc`) and the overlay a MediaTek dtbo. A stock Android boot or recovery
+refuses, which also refuses an Android remote whose boot still holds a
+half-written installer stage. The installer's own RAM stage in boot beside Couch's
+recovery (an earlier installation stopped halfway, possibly over Android's data)
+is admitted only when current data is backed up first. The session records `original_os: Couch` and
+`android_enrollment: none` in `current-couch-snapshot.json`; it is never offered
+or imported as an Android enrollment, and the bootstrap recovery tool admits its
+`couch_device_bound` binding. To check that decision offline against saved
+captures, read-only and printing classes only:
+
+```sh
+cargo run --locked --example classify_saved_images -- ~/.couch-installer
+```
 
 The public payload contains only `manifest.json`, `userdata.ext4`,
 `installer.cpio.gz`, `boot.cpio.gz`, `recovery.cpio.gz`, `zImage` and `logo.bgra`.
@@ -189,7 +242,8 @@ marker that only ever reaches the remote inside a `printf` format argument, so
 the tty's echo can never be read as an answer. The read-only probes are
 `cat /proc/cmdline` (must carry the HA100 boot image command line),
 `test -f /mnt/alpine/opt/couch/stage2.sh` (recovery's own test that the Couch
-filesystem is mounted where only recovery mounts it),
+filesystem is attached; normal Couch mounts it at the same place, so this alone
+does not tell recovery from a normal boot),
 `readlink /mnt/alpine/opt/couch/runtime/current` (`slots/<sha256>`, or absent
 for the base runtime), `test -b /dev/mmcblk0p10` and
 `cat /sys/block/mmcblk0/device/cid`. Any answer that does not match refuses with

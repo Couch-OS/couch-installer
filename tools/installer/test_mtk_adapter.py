@@ -11,7 +11,8 @@ from unittest.mock import patch
 from contextlib import contextmanager
 
 from couch_install import InstallError, IDENTITY_PARTITIONS
-from mtk_adapter import Adapter, Wire, serve, MAX, REVIEWED_SOURCES, failure_diagnostic
+from couch_serial import FLAG_CLEAR_SHA256, Unavailable, open_couch_port
+from mtk_adapter import Adapter, Wire, serve, MAX, REVIEWED_SOURCES, couch_query_port, failure_diagnostic
 from mtk_usb import ExactUsbBackend, PacketBufferedInput, bounded_operation, supervised_operations
 from mtk_writer import _open_image, _fd_stamp, _read_at, ConnectedMtkWriter
 
@@ -228,6 +229,170 @@ raise SystemExit(serve_stdio(Fixture))
         adapter, wire = self.bind_adapter([])
         with self.assertRaisesRegex(InstallError, r'physical USB port$'):
             adapter.dispatch({'op': 'android_bind', 'serial': '0127A260301T0463'})
+
+    COUCH_PORT = {'bus': 2, 'address': 9, 'ports': [4, 1], 'vid': 0x0e8d, 'pid': 0x201c}
+
+    def couch_serial(self, answers, opened, closed):
+        class FakeSerial:
+            def __init__(self, usb, backend, selected, *, serial_port=None):
+                if answers and isinstance(answers[0], Unavailable) and answers[0].reason == 'absent':
+                    raise answers.pop(0)
+                opened.append((selected, serial_port))
+            def identify(self):
+                answer = answers.pop(0)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            def restart(self, cid):
+                opened.append(('restart', cid))
+            def close(self):
+                closed.append(True)
+        return FakeSerial
+
+    def test_couch_identify_reports_observed_and_unavailable_and_closes(self):
+        adapter, wire = self.bind_adapter([])
+        opened, closed = [], []
+        answers = [('ab'*16, FLAG_CLEAR_SHA256, 42), Unavailable('no_answer'), Unavailable('absent'),
+                   ('ab'*16, None, None)]
+        with patch('mtk_adapter.CouchSerial', self.couch_serial(answers, opened, closed)), \
+                patch('mtk_adapter.couch_query_port', return_value=None):
+            for _ in range(4):
+                adapter.dispatch({'op': 'couch_identify', 'candidate': self.COUCH_PORT})
+        results = [event for event in wire.events if isinstance(event, dict)]
+        self.assertEqual(results, [
+            {'event': 'couch_identity', 'result': 'observed', 'cid': 'ab'*16,
+             'boot_flag_sha256': FLAG_CLEAR_SHA256, 'uptime': 42},
+            {'event': 'couch_identity', 'result': 'unavailable', 'reason': 'no_answer'},
+            {'event': 'couch_identity', 'result': 'unavailable', 'reason': 'absent'},
+            {'event': 'couch_identity', 'result': 'observed', 'cid': 'ab'*16,
+             'boot_flag_sha256': None, 'uptime': None}])
+        # Every opened port is closed again, and each query had its own deadline.
+        self.assertEqual(len(closed), 3)
+        self.assertEqual(len(opened), 3)
+        self.assertEqual(opened[0][0].ports, (4, 1))
+        self.assertEqual(wire.events.count(('deadline', 22)), 4)
+        self.assertFalse(adapter.failed)
+
+    def test_couch_identify_repeats_but_is_refused_after_reboot_or_start(self):
+        adapter, wire = self.bind_adapter([])
+        opened, closed = [], []
+        answers = [('ab'*16, FLAG_CLEAR_SHA256, 200)] * 2
+        with patch('mtk_adapter.CouchSerial', self.couch_serial(list(answers), opened, closed)):
+            adapter.dispatch({'op': 'couch_identify', 'candidate': self.COUCH_PORT})
+            adapter.dispatch({'op': 'couch_identify', 'candidate': self.COUCH_PORT})
+            adapter.dispatch({'op': 'couch_reboot', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+            self.assertIn(('restart', 'ab'*16), opened)
+            self.assertEqual(wire.events[-1], {'event': 'couch_reboot', 'result': 'requested'})
+            with self.assertRaises(InstallError):
+                adapter.dispatch({'op': 'couch_identify', 'candidate': self.COUCH_PORT})
+        adapter, wire = self.bind_adapter([])
+        adapter.reader = object()
+        with patch('mtk_adapter.CouchSerial', self.couch_serial(list(answers), [], [])):
+            with self.assertRaises(InstallError):
+                adapter.dispatch({'op': 'couch_identify', 'candidate': self.COUCH_PORT})
+        self.assertEqual(wire.events, [])
+
+    def test_couch_identify_rejects_non_couch_candidate(self):
+        for candidate in ({**self.COUCH_PORT, 'pid': 0x2000}, {**self.COUCH_PORT, 'extra': 1},
+                          {**self.COUCH_PORT, 'ports': []}, {**self.COUCH_PORT, 'bus': 0}):
+            adapter, wire = self.bind_adapter([])
+            def forbidden(*args, **kwargs):
+                self.fail('Couch serial opened for an invalid port')
+            with patch('mtk_adapter.CouchSerial', forbidden):
+                with self.assertRaises(InstallError):
+                    adapter.dispatch({'op': 'couch_identify', 'candidate': candidate})
+            self.assertEqual(wire.events, [])
+        adapter, _ = self.bind_adapter([])
+        with self.assertRaises(InstallError):
+            adapter.dispatch({'op': 'couch_identify', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+
+    def clearing_serial(self, outcomes, opened):
+        class FakeSerial:
+            def __init__(self, usb, backend, selected, *, serial_port=None):
+                opened.append(serial_port)
+                self.cleared = False
+            def clear_boot_flag(self, cid):
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, tuple):
+                    # Fails after the write was sent.
+                    self.cleared = True
+                    raise outcome[1]
+                if isinstance(outcome, Exception):
+                    raise outcome
+                self.cleared = outcome is not None
+                return outcome
+            def close(self):
+                opened.append('closed')
+        return FakeSerial
+
+    def test_couch_clear_flag_reports_each_outcome_and_writes_at_most_once(self):
+        adapter, wire = self.bind_adapter([])
+        opened = []
+        command = {'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16}
+        with patch('mtk_adapter.CouchSerial', self.clearing_serial(
+                [Unavailable('cannot_open'), None, '\\0  \\0'], opened)), \
+                patch('mtk_adapter.couch_query_port', return_value=open_couch_port):
+            for _ in range(3):
+                adapter.dispatch(command)
+            # Nothing written yet by the first two, so they did not consume it;
+            # the third wrote, so a fourth is refused.
+            with self.assertRaises(InstallError):
+                adapter.dispatch(command)
+        results = [event for event in wire.events if isinstance(event, dict)]
+        self.assertEqual(results, [
+            {'event': 'couch_flag_cleared', 'result': 'unavailable', 'reason': 'cannot_open'},
+            {'event': 'couch_flag_cleared', 'result': 'already_clear'},
+            {'event': 'couch_flag_cleared', 'result': 'cleared', 'readback': '\\0  \\0'}])
+        # The one write never takes the COM route, even where the query does.
+        self.assertEqual(opened.count(None), 3)
+        self.assertNotIn(open_couch_port, opened)
+        self.assertEqual(opened.count('closed'), 3)
+        self.assertEqual(wire.events.count(('deadline', 150)), 3)
+
+    def test_a_clear_that_fails_after_its_write_stops_the_worker_without_an_answer(self):
+        adapter, wire = self.bind_adapter([])
+        opened = []
+        command = {'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16}
+        with patch('mtk_adapter.CouchSerial', self.clearing_serial(
+                [('after_write', InstallError('did not read back as cleared'))], opened)):
+            with self.assertRaises(InstallError):
+                adapter.dispatch(command)
+        self.assertTrue(adapter.couch_clear_consumed)
+        self.assertTrue(adapter.failed)
+        self.assertEqual(opened.count('closed'), 1)
+        self.assertEqual([event for event in wire.events if isinstance(event, dict)], [])
+        with self.assertRaises(InstallError):
+            adapter.dispatch(command)
+
+    def test_couch_clear_flag_is_refused_after_the_reboot_or_download_mode(self):
+        adapter, wire = self.bind_adapter([])
+        with patch('mtk_adapter.CouchSerial', self.couch_serial([], [], [])):
+            adapter.dispatch({'op': 'couch_reboot', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+        with patch('mtk_adapter.CouchSerial', self.clearing_serial(['x'], [])):
+            with self.assertRaises(InstallError):
+                adapter.dispatch({'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+        adapter, wire = self.bind_adapter([])
+        adapter.reader = object()
+        with patch('mtk_adapter.CouchSerial', self.clearing_serial(['x'], [])):
+            with self.assertRaises(InstallError):
+                adapter.dispatch({'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+            adapter, wire = self.bind_adapter([])
+            with self.assertRaises(InstallError):
+                adapter.dispatch({'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT})
+        self.assertEqual(wire.events, [])
+
+    def test_only_the_windows_identity_query_uses_the_com_port(self):
+        self.assertIs(couch_query_port('win32'), open_couch_port)
+        self.assertIsNone(couch_query_port('darwin'))
+        self.assertIsNone(couch_query_port('linux'))
+        adapter, _ = self.bind_adapter([])
+        opened = []
+        with patch('mtk_adapter.CouchSerial', self.couch_serial([], opened, [])), \
+                patch('mtk_adapter.couch_query_port', return_value=open_couch_port):
+            adapter.dispatch({'op': 'couch_reboot', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+        # The reboot keeps its libusb route: on Windows it stays a manual restart.
+        self.assertIsNone(opened[0][1])
+        self.assertIn('couch_serial.py', REVIEWED_SOURCES)
 
     def test_verified_libusb_selection_is_explicit_and_has_no_fallback(self):
         calls = []

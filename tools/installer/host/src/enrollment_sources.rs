@@ -123,7 +123,7 @@ const NATIVE_CANDIDATE_LIMIT: usize = MENU_LIMIT + 1;
 
 /// Treat two spellings of one folder as the same entry where the filesystem
 /// can confirm it. Falls back to a literal comparison when it cannot.
-fn same(left: &Path, right: &Path) -> bool {
+pub fn same(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => left == right,

@@ -485,16 +485,15 @@ fn download_agent_cid(expected: Option<&str>, observed: &str, fresh: bool) -> Re
 fn same_remote_hints(
     others: &[(String, saved_enrollment::Peek)],
     observed: &saved_enrollment::ObservedHardware,
+    restore: bool,
 ) -> String {
     let same: Vec<_> = others
         .iter()
         .filter(|(_, peek)| peek.cid == observed.cid)
         .map(|(label, peek)| {
-            let matches = peek.capacity == observed.capacity
-                && peek.identity_sha256 == observed.identity_sha256;
             format!(
                 "{label} ({})",
-                if matches {
+                if peek.matches(observed, restore) {
                     "matches this remote now"
                 } else {
                     "does not match"
@@ -502,15 +501,16 @@ fn same_remote_hints(
             )
         })
         .collect();
+    // No trailing full stop: the caller's error gets one appended.
     if same.is_empty() {
-        " No other saved enrollment on this computer is for this remote. A folder with a \
-         different storage ID belongs to another remote."
+        "No other saved enrollment on this computer is for this remote. A folder with a \
+         different storage ID belongs to another remote"
             .into()
     } else {
         format!(
-            " Other saved enrollments for this remote on this computer: {}. Run the installer \
+            "Other saved enrollments for this remote on this computer: {}. Run the installer \
              again and pick one that matches this remote now; it is checked again in full. A \
-             folder with a different storage ID belongs to another remote.",
+             folder with a different storage ID belongs to another remote",
             same.join("; ")
         )
     }
@@ -1079,29 +1079,39 @@ fn install(
             Err(error) => {
                 // The remote is left in download mode. When only calibration
                 // changed (Android started again after the folder was saved),
-                // point at any other folder for this remote that matches it now.
-                let hints = match &changed {
-                    Some(changed) => {
-                        session.checkpoint(&json!({"event":"imported_enrollment_rejected","enrollment_sha256":rejected,"calibration_changed":changed}))?;
-                        let others: Vec<_> = enrollment_sources::discover(&state_root, None)
-                            .into_iter()
-                            .filter(|candidate| {
-                                chosen_folder
-                                    .as_deref()
-                                    .is_none_or(|picked| candidate.path != picked)
-                            })
-                            .filter_map(|candidate| {
-                                Some((candidate.label(), saved_enrollment::peek(&candidate.path)?))
-                            })
-                            .collect();
-                        same_remote_hints(&others, &observation)
-                    }
-                    None => String::new(),
+                // say so plainly and point at any other folder for this
+                // remote that matches it now.
+                const OFF: &str = "Nothing was written. Hold the side Power button until the \
+                     remote turns off, then start it again";
+                let Some(changed) = &changed else {
+                    anyhow::bail!("{error:#}. {OFF}");
                 };
-                anyhow::bail!(
-                    "{error:#}. Nothing was written. Hold the side Power button until the remote \
-                     turns off, then start it again.{hints}"
+                // A journal that cannot record the rejection must not hide it.
+                let journal = session.checkpoint(&json!({"event":"imported_enrollment_rejected","enrollment_sha256":rejected,"calibration_changed":changed}));
+                let others: Vec<_> = enrollment_sources::discover(&state_root, None)
+                    .into_iter()
+                    .filter(|candidate| {
+                        chosen_folder
+                            .as_deref()
+                            .is_none_or(|picked| !enrollment_sources::same(&candidate.path, picked))
+                    })
+                    .filter_map(|candidate| {
+                        Some((candidate.label(), saved_enrollment::peek(&candidate.path)?))
+                    })
+                    .collect();
+                let mut message = format!(
+                    "The saved enrollment you picked no longer matches this remote: its \
+                     calibration has changed since it was saved ({}), which happens when Android \
+                     was started again after it was saved. {OFF}. {}",
+                    saved_enrollment::describe_calibration_change(changed),
+                    same_remote_hints(&others, &observation, restore)
                 );
+                if let Err(journal) = journal {
+                    message.push_str(&format!(
+                        ". The installation journal could not record this: {journal:#}"
+                    ));
+                }
+                anyhow::bail!("{message}");
             }
         };
         // Only now, imported in full and bound to this remote, is the folder
@@ -1595,46 +1605,76 @@ mod tests {
                 .map(|name| (name.to_string(), value.repeat(64)))
                 .collect()
         };
+        let layout = |size: u64| {
+            BTreeMap::from([(
+                "boot".to_string(),
+                saved_enrollment::Region { offset: 0, size },
+            )])
+        };
         let observed = saved_enrollment::ObservedHardware {
             cid: cid.clone(),
             capacity: 4096,
             hwcode: 0x6580,
             cid_encoding: "mt6580-legacy-le32-registers".into(),
-            partitions: BTreeMap::new(),
+            partitions: layout(512),
             identity_sha256: calibration("b"),
-            retained_sha256: BTreeMap::new(),
+            retained_sha256: BTreeMap::from([("odmdtbo".to_string(), "d".repeat(64))]),
         };
-        let peek = |cid: &str, value: &str| saved_enrollment::Peek {
+        let peek = |cid: &str, value: &str, size: u64, overlay: &str| saved_enrollment::Peek {
             cid: cid.into(),
             capacity: 4096,
             identity_sha256: calibration(value),
+            partitions: layout(size),
+            odmdtbo_sha256: overlay.repeat(64),
         };
         let others = vec![
             (
                 "Saved 2026-09-13 06:50 UTC · install-a2ba".to_string(),
-                peek(&cid, "b"),
+                peek(&cid, "b", 512, "d"),
             ),
             (
                 "Saved 2026-09-12 22:10 UTC · install-05f5".to_string(),
-                peek(&cid, "a"),
+                peek(&cid, "a", 512, "d"),
+            ),
+            (
+                "Saved 2026-09-11 09:00 UTC · install-0b0b".to_string(),
+                peek(&cid, "b", 1024, "d"),
+            ),
+            (
+                "Saved 2026-09-10 09:00 UTC · install-0d0d".to_string(),
+                peek(&cid, "b", 512, "e"),
             ),
             (
                 "Saved 2026-09-01 10:00 UTC · install-9999".to_string(),
-                peek(&"34".repeat(16), "b"),
+                peek(&"34".repeat(16), "b", 512, "d"),
             ),
         ];
-        let hints = same_remote_hints(&others, &observed);
+        let hints = same_remote_hints(&others, &observed, false);
         assert!(
             hints.contains("install-a2ba (matches this remote now)"),
             "{hints}"
         );
         assert!(hints.contains("install-05f5 (does not match)"), "{hints}");
+        // Layout and overlay count, as they do for the rebind itself ...
+        assert!(hints.contains("install-0b0b (does not match)"), "{hints}");
+        assert!(hints.contains("install-0d0d (does not match)"), "{hints}");
+        // ... except for a restore, which does not compare them.
+        let restoring = same_remote_hints(&others, &observed, true);
+        assert!(
+            restoring.contains("install-0b0b (matches this remote now)"),
+            "{restoring}"
+        );
+        assert!(
+            restoring.contains("install-0d0d (matches this remote now)"),
+            "{restoring}"
+        );
         assert!(!hints.contains("install-9999"), "{hints}");
         assert!(hints.contains("belongs to another remote"));
-        let none = same_remote_hints(&others[2..], &observed);
-        assert!(none.contains("No other saved enrollment on this computer is for this remote"));
+        assert!(!hints.ends_with('.'));
+        let none = same_remote_hints(&others[4..], &observed, false);
+        assert!(none.starts_with("No other saved enrollment on this computer is for this remote"));
+        assert!(!none.ends_with('.'));
     }
-
     #[test]
     fn a_remote_left_in_download_mode_is_told_to_power_off() {
         let couch = json!({"bus":1,"address":5,"ports":[4],"vid":0x0e8d,"pid":0x201c});

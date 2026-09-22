@@ -209,7 +209,10 @@ fn calibration_difference(
     live: &BTreeMap<String, String>,
     saved: &BTreeMap<String, String>,
 ) -> String {
-    let changed = changed_calibration(live, saved);
+    describe_calibration_change(&changed_calibration(live, saved))
+}
+/// The same wording from a list of changed areas.
+pub fn describe_calibration_change(changed: &[String]) -> String {
     let mut unchanged: Vec<_> = IDENTITY
         .into_iter()
         .filter(|name| !changed.iter().any(|other| other == name))
@@ -233,15 +236,33 @@ pub struct Peek {
     pub cid: String,
     pub capacity: u64,
     pub identity_sha256: BTreeMap<String, String>,
+    pub partitions: BTreeMap<String, Region>,
+    pub odmdtbo_sha256: String,
+}
+impl Peek {
+    /// Whether this folder would pass `rebind_mode` against `observed` as
+    /// far as its record says: the same CID, capacity and calibration, and,
+    /// unless restoring, the same layout and overlay. Its files are not
+    /// checked here; that is what the import does.
+    pub fn matches(&self, observed: &ObservedHardware, restore: bool) -> bool {
+        self.cid == observed.cid
+            && self.capacity == observed.capacity
+            && self.identity_sha256 == observed.identity_sha256
+            && (restore
+                || (self.partitions == observed.partitions
+                    && observed.retained_sha256.get("odmdtbo") == Some(&self.odmdtbo_sha256)))
+    }
 }
 pub fn peek(source: &Path) -> Option<Peek> {
     let bytes = read(&source.join("enrollment.json"), 65536).ok()?;
     let record: Record = serde_json::from_slice(&bytes).ok()?;
     validate(&record).ok()?;
     Some(Peek {
+        odmdtbo_sha256: record.originals.get("odmdtbo")?.sha256.clone(),
         cid: record.cid,
         capacity: record.capacity,
         identity_sha256: record.identity_sha256,
+        partitions: record.partitions,
     })
 }
 impl BoundEnrollment {
@@ -757,15 +778,33 @@ mod tests {
         fs::create_dir(&folder).unwrap();
         assert!(peek(&folder).is_none());
         let record = record();
-        fs::write(
-            folder.join("enrollment.json"),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
+        let bytes = serde_json::to_vec(&record).unwrap();
+        fs::write(folder.join("enrollment.json"), &bytes).unwrap();
         let found = peek(&folder).unwrap();
         assert_eq!(found.cid, record.cid);
         assert_eq!(found.capacity, record.capacity);
         assert_eq!(found.identity_sha256, record.identity_sha256);
+        assert_eq!(found.partitions, record.partitions);
+        assert_eq!(found.odmdtbo_sha256, record.originals["odmdtbo"].sha256);
+        // It matches the way rebind_mode does: layout and overlay count
+        // except for a restore.
+        let live = observed(&record);
+        assert!(found.matches(&live, false));
+        let mut moved = observed(&record);
+        moved.partitions.get_mut("boot").unwrap().size += 4096;
+        assert!(!found.matches(&moved, false));
+        assert!(found.matches(&moved, true));
+        let mut overlay = observed(&record);
+        overlay
+            .retained_sha256
+            .insert("odmdtbo".into(), "b".repeat(64));
+        assert!(!found.matches(&overlay, false));
+        assert!(found.matches(&overlay, true));
+        let mut calibration = observed(&record);
+        calibration
+            .identity_sha256
+            .insert("nvdata".into(), "b".repeat(64));
+        assert!(!found.matches(&calibration, true));
         let mut couch = record.clone();
         couch.original_os = "Couch".into();
         fs::write(
@@ -776,6 +815,19 @@ mod tests {
         assert!(peek(&folder).is_none());
         fs::write(folder.join("enrollment.json"), b"not json").unwrap();
         assert!(peek(&folder).is_none());
+        // Too large to be a record, or not a plain file: nothing is read.
+        let mut padded = bytes.clone();
+        padded.resize(70_000, b' ');
+        fs::write(folder.join("enrollment.json"), padded).unwrap();
+        assert!(peek(&folder).is_none());
+        #[cfg(unix)]
+        {
+            let elsewhere = root.path().join("real.json");
+            fs::write(&elsewhere, &bytes).unwrap();
+            fs::remove_file(folder.join("enrollment.json")).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, folder.join("enrollment.json")).unwrap();
+            assert!(peek(&folder).is_none());
+        }
     }
     #[test]
     fn restore_binds_across_changed_os_partitions_but_not_changed_hardware() {

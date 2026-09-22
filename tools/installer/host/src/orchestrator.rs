@@ -381,7 +381,8 @@ fn confirm_without_enrollment(ui: &mut Ui, skip_userdata: bool) -> Result<bool> 
     };
     let body = format!(
         "Couch will be reinstalled using only what is on the remote now.\n\nKept: before \
-         anything is written, the remote's factory calibration (its Wi-Fi and Bluetooth \
+         anything is written (except the COUCH RECOVERY flag, and only if you choose to clear \
+         it), the remote's factory calibration (its Wi-Fi and Bluetooth \
          settings made at the factory) and its current boot, recovery and logo images are saved \
          to this computer and checked against the remote. The installer never writes \
          calibration. {data}\n\nGiven up: the saved enrollment is the only copy of the remote's \
@@ -883,7 +884,7 @@ fn install(
             let selected = ui.choose(
                 "Select the connected Couch remote",
                 if fresh {
-                    "Choose the remote that is running Couch now. It is checked over USB before it is restarted, and nothing is written until its storage and calibration have been saved and checked."
+                    "Choose the remote that is running Couch now. It is checked over USB before it is restarted, and nothing is written until its storage and calibration have been saved and checked, except the COUCH RECOVERY flag, and only if you choose to clear it."
                 } else {
                     "Its stored CID and calibration must match the imported enrollment before any write."
                 },

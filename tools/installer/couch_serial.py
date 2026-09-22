@@ -25,6 +25,11 @@ REASONS = frozenset(('absent', 'no_serial_function', 'cannot_open', 'no_answer')
 # of `para` is written, exactly as Couch clears it after a healthy boot.
 CLEAR_BCB = b'dd if=/dev/zero of=/dev/mmcblk0p10 bs=512 count=1 conv=notrunc; sync'
 READ_BACK = b'dd if=/dev/mmcblk0p10 bs=512 count=1 2>/dev/null | od -An -c | head -1'
+# The recovery action's read-only checks before that write, also byte for byte:
+# an HA100 Couch boot image, and the boot flag partition present.
+PROBE_CMDLINE = b'cat /proc/cmdline'
+PROBE_BCB = b'test -b /dev/mmcblk0p10 && echo ok'
+HA100_CMDLINE = 'bootopt=64S3,32S1,32S1'
 # A running Couch has had its COM port for a long time; this only covers
 # Windows starting its serial driver right after the remote reconnected. With
 # the transport's own 2 s open retry and the 5 s answer bound, a query stays
@@ -210,30 +215,41 @@ class CouchSerial:
         line = (b'\nprintf "\\n%s:BEGIN\\n" ' + marker + b'; ' + command
                 + b'; printf "\\n%s:%s:END\\n" ' + marker + b' "$?"\n')
         pattern = re.compile(rb'\n' + marker + rb':BEGIN\n(.*?)\n' + marker + rb':([0-9]{1,3}):END\n', re.S)
-        require(self.outgoing.write(line, timeout=1000) == len(line), 'Couch flag command write incomplete')
-        output = bytearray()
-        deadline = time.monotonic() + budget
-        while time.monotonic() < deadline:
-            try:
-                part = bytes(self.incoming.read(512, timeout=250))
-            except self.usb.core.USBTimeoutError:
-                continue
-            output.extend(part.replace(b'\r', b''))
-            require(len(output) <= 16384, 'Couch flag answer exceeds bound')
-            found = pattern.search(output)
-            if found:
-                return int(found.group(2)), found.group(1).decode('ascii', 'replace')
-        require(False, 'Couch flag command did not answer in time')
+        # Any fault here is "no answer". Before the write that means nothing
+        # was changed; clear_boot_flag turns it into a hard stop after it.
+        try:
+            if self.outgoing.write(line, timeout=1000) != len(line):
+                raise Unavailable('no_answer', 'Couch command write incomplete')
+            output = bytearray()
+            deadline = time.monotonic() + budget
+            while time.monotonic() < deadline:
+                try:
+                    part = bytes(self.incoming.read(512, timeout=250))
+                except self.usb.core.USBTimeoutError:
+                    continue
+                output.extend(part.replace(b'\r', b''))
+                if len(output) > 16384:
+                    raise Unavailable('no_answer', 'Couch answer exceeds bound')
+                found = pattern.search(output)
+                if found:
+                    return int(found.group(2)), found.group(1).decode('ascii', 'replace')
+        except Unavailable:
+            raise
+        except Exception as error:
+            raise Unavailable('no_answer', 'Couch command unavailable') from error
+        raise Unavailable('no_answer', 'Couch command did not answer in time')
 
     def clear_boot_flag(self, expected_cid):
         """Clear an armed recovery flag, prove it clear, and return the readback.
 
         Writes only when this session's own query shows the expected CID and
-        the block holds exactly the armed value; an already clear block is
-        left alone and reported as None. Up to that point any failure is
-        Unavailable and nothing was written. From the write on, every failure
-        is a hard stop: the flag may already be clear, and nothing is retried
-        or restarted automatically.
+        the block holds exactly the armed value, and the recovery action's own
+        probes show an HA100 Couch boot image with its boot flag partition; an
+        already clear block is left alone and reported as None. Up to that
+        point a silent remote is Unavailable, a wrong one a hard refusal, and
+        nothing was written. From the write on, every failure is a hard stop:
+        the flag may already be clear, and nothing is retried or restarted
+        automatically.
         """
         require(re.fullmatch('[0-9a-f]{32}', expected_cid) is not None, 'Invalid Couch CID')
         require(not self.attempted and not self.cleared, 'Couch flag clear already attempted')
@@ -242,6 +258,11 @@ class CouchSerial:
         if flag == FLAG_CLEAR_SHA256:
             return None
         require(flag == FLAG_ARMED_SHA256, 'Couch recovery flag holds an unexpected value; nothing written')
+        status, cmdline = self._framed(PROBE_CMDLINE, 10)
+        require(status == 0 and HA100_CMDLINE in cmdline,
+                'Not an HA100 Couch boot image; recovery flag not cleared')
+        _, partition = self._framed(PROBE_BCB, 10)
+        require(partition.strip() == 'ok', 'Boot flag partition missing; recovery flag not cleared')
         self.cleared = True
         try:
             self._framed(CLEAR_BCB, 60)

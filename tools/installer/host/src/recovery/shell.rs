@@ -496,13 +496,17 @@ mod tests {
 
     #[test]
     fn a_reinstall_clears_the_flag_with_exactly_these_commands() {
-        // The worker that clears a stuck flag before a reinstall sends these
-        // same two commands and applies the same zero check.
+        // The worker that clears a stuck flag before a reinstall runs the same
+        // two pre-write probes, sends these same two commands and applies the
+        // same zero check.
         // Compared line by line: a Windows checkout may end its lines in CRLF.
         let worker = include_str!("../../../couch_serial.py");
         for line in [
             format!("CLEAR_BCB = b'{CLEAR_BCB}'"),
             format!("READ_BACK = b'{READ_BACK}'"),
+            format!("PROBE_CMDLINE = b'{PROBE_CMDLINE}'"),
+            format!("PROBE_BCB = b'{PROBE_BCB}'"),
+            format!("HA100_CMDLINE = '{HA100_CMDLINE}'"),
         ] {
             assert!(worker.lines().any(|found| found == line), "{line}");
         }

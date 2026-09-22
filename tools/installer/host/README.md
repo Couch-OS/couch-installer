@@ -132,19 +132,27 @@ The CID must match, and the remote is restarted only once the flag reads clear:
 an armed flag on a remote up for less than 170 s waits until 180 s of uptime
 and asks again, and one still armed after that wait stops at a not-ready screen.
 A flag still armed after 170 s will not clear by itself (the remote is in COUCH
-RECOVERY, or its GUI never became healthy), so the installer offers to clear it:
-the worker re-reads the CID and requires exactly the armed block, sends the
-recovery action's own `dd` clear and `od` readback (a host test keeps the two
-command strings identical), requires a zero readback and a clear digest, and at
-most once per worker; the one-shot reboot then restarts the remote straight into
-download mode. An unknown flag, or a remote that does not answer three
-queries two seconds apart, needs the user to confirm the normal screen has been
-up for three minutes; a silent remote is then restarted by hand. The unchanged
-one-shot reboot, which re-reads the CID, follows two seconds after the query,
-since macOS re-enumerates the device when libusb releases it. On Windows the
-query uses the COM port Windows created for Couch's serial function, found by
-physical port chain like the RAM stage's port; a flag clear goes the same way,
-and the reboot remains a manual Power-button restart. A CID mismatch or ambiguous reboot stops without retry.
+RECOVERY, or its GUI never became healthy), so the installer offers to clear it.
+The request is journaled first. The worker then re-reads the CID and requires
+exactly the armed block, runs the recovery action's own pre-write probes (the
+HA100 boot command line and the `mmcblk0p10` block device), sends its `dd`
+clear and `od` readback (a host test keeps all these command strings
+identical), and requires a zero readback and a clear digest, at most once per
+worker. Any failure after the write stops without a restart, saying the flag
+may already be clear. The one-shot reboot then restarts the remote straight
+into download mode. An unknown flag first waits until 180 s of uptime (the full
+180 s on a retry without an uptime); an unknown flag after that, or a remote
+that does not answer three queries two seconds apart, needs the user to confirm
+the normal screen has been up for three minutes, and a silent remote is then
+restarted by hand. The unchanged one-shot reboot, which re-reads the CID,
+follows two seconds after the query, since macOS re-enumerates the device when
+libusb releases it. On Windows the query uses the COM port Windows created for
+Couch's serial function, and only one whose reported location matches the
+selected physical port chain exactly (never a port of unknown location);
+anything else falls back to the manual restart. The reboot and the flag clear
+go through libusb only, so on Windows the restart is a manual Power-button
+restart and the clear is not offered until it has been tested on hardware.
+A CID mismatch or ambiguous reboot stops without retry.
 Download-mode CID, full layout, calibration and retained device-tree identity
 are checked again before writing. Current Couch originals are saved separately
 and marked Couch; imported Android originals are preserved for Android recovery

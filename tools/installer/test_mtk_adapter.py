@@ -313,6 +313,10 @@ raise SystemExit(serve_stdio(Fixture))
                 self.cleared = False
             def clear_boot_flag(self, cid):
                 outcome = outcomes.pop(0)
+                if isinstance(outcome, tuple):
+                    # Fails after the write was sent.
+                    self.cleared = True
+                    raise outcome[1]
                 if isinstance(outcome, Exception):
                     raise outcome
                 self.cleared = outcome is not None
@@ -339,10 +343,26 @@ raise SystemExit(serve_stdio(Fixture))
             {'event': 'couch_flag_cleared', 'result': 'unavailable', 'reason': 'cannot_open'},
             {'event': 'couch_flag_cleared', 'result': 'already_clear'},
             {'event': 'couch_flag_cleared', 'result': 'cleared', 'readback': '\\0  \\0'}])
-        # The clear goes the way the query does: the COM port on Windows.
-        self.assertEqual(opened.count(open_couch_port), 3)
+        # The one write never takes the COM route, even where the query does.
+        self.assertEqual(opened.count(None), 3)
+        self.assertNotIn(open_couch_port, opened)
         self.assertEqual(opened.count('closed'), 3)
-        self.assertEqual(wire.events.count(('deadline', 120)), 3)
+        self.assertEqual(wire.events.count(('deadline', 150)), 3)
+
+    def test_a_clear_that_fails_after_its_write_stops_the_worker_without_an_answer(self):
+        adapter, wire = self.bind_adapter([])
+        opened = []
+        command = {'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16}
+        with patch('mtk_adapter.CouchSerial', self.clearing_serial(
+                [('after_write', InstallError('did not read back as cleared'))], opened)):
+            with self.assertRaises(InstallError):
+                adapter.dispatch(command)
+        self.assertTrue(adapter.couch_clear_consumed)
+        self.assertTrue(adapter.failed)
+        self.assertEqual(opened.count('closed'), 1)
+        self.assertEqual([event for event in wire.events if isinstance(event, dict)], [])
+        with self.assertRaises(InstallError):
+            adapter.dispatch(command)
 
     def test_couch_clear_flag_is_refused_after_the_reboot_or_download_mode(self):
         adapter, wire = self.bind_adapter([])

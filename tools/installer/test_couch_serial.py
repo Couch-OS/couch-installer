@@ -5,8 +5,8 @@ import unittest
 from couch_install import InstallError
 import itertools
 from unittest.mock import patch
-from couch_serial import (CLEAR_BCB, CouchSerial, FLAG_ARMED_SHA256, FLAG_CLEAR_SHA256, READ_BACK,
-                          Unavailable, open_couch_port)
+from couch_serial import (CLEAR_BCB, CouchSerial, FLAG_ARMED_SHA256, FLAG_CLEAR_SHA256, HA100_CMDLINE,
+                          PROBE_BCB, PROBE_CMDLINE, READ_BACK, Unavailable, open_couch_port)
 
 ZEROS = '\\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0'
 
@@ -254,20 +254,32 @@ class FlagClearTests(unittest.TestCase):
     """A remote whose shell answers the identity query and the framed commands."""
 
     def remote(self, *, cid='1'*32, flag=FLAG_ARMED_SHA256, readback=ZEROS, readback_status=0,
-               silent_after_write=False):
+               silent_after_write=False, cmdline='console=tty0 bootopt=64S3,32S1,32S1 buildvariant=user',
+               partition='ok', silent_probes=False, wrap=False):
         serial = CouchSerial.__new__(CouchSerial)
         serial.attempted = serial.cleared = False
         state = {'flag': flag}
         writes, pending = [], bytearray()
         def write(data, **kwargs):
             writes.append(data)
-            pending.extend(data.replace(b'\n', b'\r\n'))  # the tty echoes everything
+            echo = data.replace(b'\n', b'\r\n')  # the tty echoes everything
+            if wrap:
+                # A wrapping terminal can break the echoed line before a marker.
+                echo = re.sub(rb'(COUCH[-_][A-Z-]*[0-9a-f]{32})', rb'\r\n\1', echo)
+            pending.extend(echo)
             if b'sha256sum' in data:
                 marker = re.search(rb'COUCH_[0-9a-f]{32}', data).group()
                 pending.extend(b'\r\n' + marker + b':' + cid.encode() + b':' + state['flag'].encode()
                                + b':900:END\r\n')
                 return len(data)
             marker = re.search(rb'COUCH-RECOVERY-[0-9a-f]{32}', data).group()
+            if PROBE_CMDLINE in data or PROBE_BCB in data:
+                if silent_probes:
+                    return len(data)
+                body = (cmdline if PROBE_CMDLINE in data else partition).encode() + b'\r\n'
+                pending.extend(b'\r\n' + marker + b':BEGIN\r\n' + body + b'\r\n' + marker
+                               + b':' + (b'0' if body.strip() else b'1') + b':END\r\n')
+                return len(data)
             if CLEAR_BCB in data:
                 if silent_after_write:
                     return len(data)
@@ -289,7 +301,11 @@ class FlagClearTests(unittest.TestCase):
         return serial, writes, state
 
     def kinds(self, writes):
-        return ['query' if b'sha256sum' in w else 'clear' if CLEAR_BCB in w else 'readback' for w in writes]
+        return ['query' if b'sha256sum' in w else 'clear' if CLEAR_BCB in w
+                else 'cmdline' if PROBE_CMDLINE in w else 'partition' if PROBE_BCB in w
+                else 'readback' for w in writes]
+
+    PROBED = ['query', 'cmdline', 'partition']
 
     def test_the_only_write_is_the_first_block_of_para(self):
         self.assertEqual(CLEAR_BCB, b'dd if=/dev/zero of=/dev/mmcblk0p10 bs=512 count=1 conv=notrunc; sync')
@@ -298,14 +314,14 @@ class FlagClearTests(unittest.TestCase):
     def test_clear_writes_only_after_the_expected_cid_and_the_armed_value(self):
         serial, writes, state = self.remote()
         self.assertEqual(serial.clear_boot_flag('1'*32), ZEROS)
-        self.assertEqual(self.kinds(writes), ['query', 'clear', 'readback', 'query'])
+        self.assertEqual(self.kinds(writes), self.PROBED + ['clear', 'readback', 'query'])
         self.assertEqual(state['flag'], FLAG_CLEAR_SHA256)
         self.assertTrue(serial.cleared)
         self.assertFalse(serial.attempted)
         self.assertFalse(any(b'reboot' in w for w in writes))
         # At most once per session.
         with self.assertRaises(InstallError): serial.clear_boot_flag('1'*32)
-        self.assertEqual(len(writes), 4)
+        self.assertEqual(len(writes), 6)
 
     def test_clear_never_writes_for_another_remote_or_an_unexpected_block(self):
         for cid, flag in (('2'*32, FLAG_ARMED_SHA256), ('1'*32, 'e'*64), ('1'*32, '')):
@@ -324,7 +340,7 @@ class FlagClearTests(unittest.TestCase):
             serial, writes, _ = self.remote(readback=readback, readback_status=status)
             with self.assertRaises(InstallError) as raised: serial.clear_boot_flag('1'*32)
             self.assertNotIsInstance(raised.exception, Unavailable)
-            self.assertEqual(self.kinds(writes), ['query', 'clear', 'readback'])
+            self.assertEqual(self.kinds(writes), self.PROBED + ['clear', 'readback'])
             self.assertTrue(serial.cleared)
 
     def test_a_write_that_is_never_answered_is_a_hard_stop_not_unavailable(self):
@@ -332,7 +348,7 @@ class FlagClearTests(unittest.TestCase):
         with patch('couch_serial.time.monotonic', side_effect=itertools.count()):
             with self.assertRaises(InstallError) as raised: serial.clear_boot_flag('1'*32)
         self.assertNotIsInstance(raised.exception, Unavailable)
-        self.assertEqual(self.kinds(writes), ['query', 'clear'])
+        self.assertEqual(self.kinds(writes), self.PROBED + ['clear'])
         self.assertTrue(serial.cleared)
 
     def test_a_silent_remote_is_unavailable_and_nothing_is_written(self):
@@ -342,6 +358,34 @@ class FlagClearTests(unittest.TestCase):
             with self.assertRaises(Unavailable): serial.clear_boot_flag('1'*32)
         self.assertEqual(self.kinds(writes), ['query'])
         self.assertFalse(serial.cleared)
+
+    def test_the_recovery_actions_probes_come_first_and_can_refuse(self):
+        self.assertEqual(PROBE_CMDLINE, b'cat /proc/cmdline')
+        self.assertEqual(PROBE_BCB, b'test -b /dev/mmcblk0p10 && echo ok')
+        self.assertEqual(HA100_CMDLINE, 'bootopt=64S3,32S1,32S1')
+        # Not an HA100 Couch image, or no boot flag partition: refused, unwritten.
+        for kwargs, kinds in (({'cmdline': 'console=ttyS0 root=/dev/sda1'}, ['query', 'cmdline']),
+                              ({'partition': ''}, self.PROBED)):
+            serial, writes, state = self.remote(**kwargs)
+            with self.assertRaises(InstallError) as raised: serial.clear_boot_flag('1'*32)
+            self.assertNotIsInstance(raised.exception, Unavailable)
+            self.assertEqual(self.kinds(writes), kinds)
+            self.assertFalse(serial.cleared)
+            self.assertEqual(state['flag'], FLAG_ARMED_SHA256)
+        # A probe that is never answered: unavailable, and still unwritten.
+        serial, writes, _ = self.remote(silent_probes=True)
+        with patch('couch_serial.time.monotonic', side_effect=itertools.count()):
+            with self.assertRaises(Unavailable): serial.clear_boot_flag('1'*32)
+        self.assertEqual(self.kinds(writes), ['query', 'cmdline'])
+        self.assertFalse(serial.cleared)
+
+    def test_a_wrapped_echo_of_a_framed_command_is_not_its_answer(self):
+        serial, writes, _ = self.remote(wrap=True, silent_probes=True)
+        with patch('couch_serial.time.monotonic', side_effect=itertools.count()):
+            with self.assertRaises(Unavailable): serial.clear_boot_flag('1'*32)
+        self.assertFalse(serial.cleared)
+        serial, writes, _ = self.remote(wrap=True)
+        self.assertEqual(serial.clear_boot_flag('1'*32), ZEROS)
 
     def test_the_echoed_command_is_never_read_as_its_answer(self):
         serial, writes, _ = self.remote()

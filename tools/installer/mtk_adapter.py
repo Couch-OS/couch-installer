@@ -41,11 +41,12 @@ def couch_candidate(raw):
 
 
 def couch_query_port(platform=sys.platform):
-    """How the identity query and the flag clear reach Couch's serial function.
+    """How the read-only identity query reaches Couch's serial function.
 
-    Windows binds its serial-port driver to it, so they go through that COM
-    port, found by physical port chain as the RAM stage's is. The reboot keeps
-    its libusb-only route, so on Windows it stays a manual restart.
+    Windows binds its serial-port driver to it, so the query goes through that
+    COM port, found by its exact physical port chain. The reboot and the
+    recovery-flag clear keep the libusb-only route, so on Windows the restart
+    stays manual and the clear is not offered until it has been tested there.
     """
     return open_couch_port if platform == 'win32' else None
 
@@ -272,9 +273,11 @@ class Adapter:
             selected = couch_candidate(command['candidate'])
             serial = None
             try:
-                with self.wire.deadline(120):
-                    serial = CouchSerial(self.backend.usb, self.backend.usb_backend, selected,
-                                         serial_port=couch_query_port())
+                # libusb only: no COM route for the one write. Two probes, the
+                # write with its sync, the readback and two queries fit well
+                # inside this deadline and the host's 180 s.
+                with self.wire.deadline(150):
+                    serial = CouchSerial(self.backend.usb, self.backend.usb_backend, selected)
                     readback = serial.clear_boot_flag(command['cid'])
                 event = ({'event': 'couch_flag_cleared', 'result': 'already_clear'} if readback is None
                          else {'event': 'couch_flag_cleared', 'result': 'cleared', 'readback': readback})

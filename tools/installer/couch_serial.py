@@ -1,14 +1,16 @@
-"""Fixed queries and at most one reboot on an explicitly selected Couch CDC port.
+"""Fixed queries, one flag clear and at most one reboot on a selected Couch CDC port.
 
 The identity query is read-only: it reads the storage CID, the SHA-256 of the
 first 512 bytes of the bootloader control block and the uptime, and never
 writes or restarts anything. The restart re-reads the CID and sends one fixed
-reboot only when it equals the expected value.
+reboot only when it equals the expected value. The only write, clearing a
+recovery flag that will not clear by itself, uses exactly the commands of the
+host's "My remote shows COUCH RECOVERY" action and happens at most once.
 """
 import re
 import secrets
 import time
-from couch_install import require
+from couch_install import InstallError, require
 from mtk_com import open_serial_port
 from mtk_session import Candidate
 
@@ -19,6 +21,11 @@ from mtk_session import Candidate
 FLAG_CLEAR_SHA256 = '076a27c79e5ace2a3d47f9dd2e83e4ff6ea8872b3c2218f66c92b89b55f36560'
 FLAG_ARMED_SHA256 = '9418492e5b413376d2927de020eecc19a0be271687c4edb6437b7ce7268a2171'
 REASONS = frozenset(('absent', 'no_serial_function', 'cannot_open', 'no_answer'))
+# The recovery action's own write and readback (host/src/recovery/shell.rs),
+# byte for byte; a host test checks they stay identical. Only the first block
+# of `para` is written, exactly as Couch clears it after a healthy boot.
+CLEAR_BCB = b'dd if=/dev/zero of=/dev/mmcblk0p10 bs=512 count=1 conv=notrunc; sync'
+READ_BACK = b'dd if=/dev/mmcblk0p10 bs=512 count=1 2>/dev/null | od -An -c | head -1'
 # A running Couch has had its COM port for a long time; this only covers
 # Windows starting its serial driver right after the remote reconnected.
 COUCH_PORT_WAIT = 6.0
@@ -61,6 +68,7 @@ class CouchSerial:
         self.usb, self.device, self.port = usb, None, None
         self.claimed, self.detached = [], []
         self.attempted = False
+        self.cleared = False
         try:
             devices = [d for d in usb.core.find(find_all=True, idVendor=0x0e8d,
                        idProduct=0x201c, backend=backend)
@@ -165,6 +173,63 @@ class CouchSerial:
         return (cid.lower(),
                 flag if re.fullmatch('[0-9a-f]{64}', flag) else None,
                 int(uptime) if re.fullmatch('[0-9]{1,9}', uptime) else None)
+
+    def _framed(self, command, budget):
+        """Run one fixed command; return its exit status and output.
+
+        Framed the way the recovery action frames it: the marker reaches the
+        remote only as a printf argument, so the echoed command never matches.
+        """
+        marker = ('COUCH-RECOVERY-' + secrets.token_hex(16)).encode()
+        line = (b'\nprintf "\\n%s:BEGIN\\n" ' + marker + b'; ' + command
+                + b'; printf "\\n%s:%s:END\\n" ' + marker + b' "$?"\n')
+        pattern = re.compile(rb'\n' + marker + rb':BEGIN\n(.*?)\n' + marker + rb':([0-9]{1,3}):END\n', re.S)
+        require(self.outgoing.write(line, timeout=1000) == len(line), 'Couch flag command write incomplete')
+        output = bytearray()
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            try:
+                part = bytes(self.incoming.read(512, timeout=250))
+            except self.usb.core.USBTimeoutError:
+                continue
+            output.extend(part.replace(b'\r', b''))
+            require(len(output) <= 16384, 'Couch flag answer exceeds bound')
+            found = pattern.search(output)
+            if found:
+                return int(found.group(2)), found.group(1).decode('ascii', 'replace')
+        require(False, 'Couch flag command did not answer in time')
+
+    def clear_boot_flag(self, expected_cid):
+        """Clear an armed recovery flag, prove it clear, and return the readback.
+
+        Writes only when this session's own query shows the expected CID and
+        the block holds exactly the armed value; an already clear block is
+        left alone and reported as None. Up to that point any failure is
+        Unavailable and nothing was written. From the write on, every failure
+        is a hard stop: the flag may already be clear, and nothing is retried
+        or restarted automatically.
+        """
+        require(re.fullmatch('[0-9a-f]{32}', expected_cid) is not None, 'Invalid Couch CID')
+        require(not self.attempted and not self.cleared, 'Couch flag clear already attempted')
+        cid, flag, _ = self.identify()
+        require(cid == expected_cid, 'Connected Couch CID differs; recovery flag not cleared')
+        if flag == FLAG_CLEAR_SHA256:
+            return None
+        require(flag == FLAG_ARMED_SHA256, 'Couch recovery flag holds an unexpected value; nothing written')
+        self.cleared = True
+        try:
+            self._framed(CLEAR_BCB, 60)
+            status, readback = self._framed(READ_BACK, 20)
+            fields = readback.split()
+            require(status == 0 and fields and all(field == '\\0' for field in fields),
+                    'Couch recovery flag did not read back as cleared; the remote was not restarted')
+            cid, flag, _ = self.identify()
+        except Unavailable as error:
+            raise InstallError('Couch recovery flag clear was interrupted; the remote was not '
+                               'restarted') from error
+        require(cid == expected_cid and flag == FLAG_CLEAR_SHA256,
+                'Couch recovery flag is not clear after the write; the remote was not restarted')
+        return readback.strip()
 
     def restart(self, expected_cid):
         require(re.fullmatch('[0-9a-f]{32}', expected_cid) is not None, 'Invalid retained CID')

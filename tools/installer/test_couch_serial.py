@@ -3,8 +3,13 @@ import re
 from types import SimpleNamespace as NS
 import unittest
 from couch_install import InstallError
-from couch_serial import (CouchSerial, FLAG_ARMED_SHA256, FLAG_CLEAR_SHA256, Unavailable,
-                          open_couch_port)
+import itertools
+from unittest.mock import patch
+from couch_serial import (CLEAR_BCB, CouchSerial, FLAG_ARMED_SHA256, FLAG_CLEAR_SHA256, READ_BACK,
+                          Unavailable, open_couch_port)
+
+ZEROS = '\\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0  \\0'
+
 
 
 class SerialTests(unittest.TestCase):
@@ -219,6 +224,109 @@ class SerialTests(unittest.TestCase):
         finally:
             couch_serial.open_serial_port = saved
         self.assertEqual(seen, ['COM7'])
+
+
+
+class FlagClearTests(unittest.TestCase):
+    """A remote whose shell answers the identity query and the framed commands."""
+
+    def remote(self, *, cid='1'*32, flag=FLAG_ARMED_SHA256, readback=ZEROS, readback_status=0,
+               silent_after_write=False):
+        serial = CouchSerial.__new__(CouchSerial)
+        serial.attempted = serial.cleared = False
+        state = {'flag': flag}
+        writes, pending = [], bytearray()
+        def write(data, **kwargs):
+            writes.append(data)
+            pending.extend(data.replace(b'\n', b'\r\n'))  # the tty echoes everything
+            if b'sha256sum' in data:
+                marker = re.search(rb'COUCH_[0-9a-f]{32}', data).group()
+                pending.extend(b'\r\n' + marker + b':' + cid.encode() + b':' + state['flag'].encode()
+                               + b':900:END\r\n')
+                return len(data)
+            marker = re.search(rb'COUCH-RECOVERY-[0-9a-f]{32}', data).group()
+            if CLEAR_BCB in data:
+                if silent_after_write:
+                    return len(data)
+                state['flag'] = FLAG_CLEAR_SHA256
+                body, status = b'1+0 records in\r\n1+0 records out\r\n', 0
+            else:
+                self.assertIn(READ_BACK, data)
+                body, status = readback.encode() + b'\r\n', readback_status
+            pending.extend(b'\r\n' + marker + b':BEGIN\r\n' + body + b'\r\n' + marker + b':'
+                           + str(status).encode() + b':END\r\n')
+            return len(data)
+        def read(size, **kwargs):
+            if not pending:
+                raise TimeoutError('nothing yet')
+            value = bytes(pending[:size]); del pending[:size]; return value
+        serial.outgoing = NS(write=write)
+        serial.incoming = NS(read=read)
+        serial.usb = NS(core=NS(USBTimeoutError=TimeoutError))
+        return serial, writes, state
+
+    def kinds(self, writes):
+        return ['query' if b'sha256sum' in w else 'clear' if CLEAR_BCB in w else 'readback' for w in writes]
+
+    def test_the_only_write_is_the_first_block_of_para(self):
+        self.assertEqual(CLEAR_BCB, b'dd if=/dev/zero of=/dev/mmcblk0p10 bs=512 count=1 conv=notrunc; sync')
+        self.assertNotIn(b'of=', READ_BACK)
+
+    def test_clear_writes_only_after_the_expected_cid_and_the_armed_value(self):
+        serial, writes, state = self.remote()
+        self.assertEqual(serial.clear_boot_flag('1'*32), ZEROS)
+        self.assertEqual(self.kinds(writes), ['query', 'clear', 'readback', 'query'])
+        self.assertEqual(state['flag'], FLAG_CLEAR_SHA256)
+        self.assertTrue(serial.cleared)
+        self.assertFalse(serial.attempted)
+        self.assertFalse(any(b'reboot' in w for w in writes))
+        # At most once per session.
+        with self.assertRaises(InstallError): serial.clear_boot_flag('1'*32)
+        self.assertEqual(len(writes), 4)
+
+    def test_clear_never_writes_for_another_remote_or_an_unexpected_block(self):
+        for cid, flag in (('2'*32, FLAG_ARMED_SHA256), ('1'*32, 'e'*64), ('1'*32, '')):
+            serial, writes, _ = self.remote(cid=cid, flag=flag)
+            with self.assertRaises(InstallError): serial.clear_boot_flag('1'*32)
+            self.assertEqual(self.kinds(writes), ['query'])
+            self.assertFalse(serial.cleared)
+        # An already clear block is left alone.
+        serial, writes, _ = self.remote(flag=FLAG_CLEAR_SHA256)
+        self.assertIsNone(serial.clear_boot_flag('1'*32))
+        self.assertEqual(self.kinds(writes), ['query'])
+        self.assertFalse(serial.cleared)
+
+    def test_a_block_that_does_not_read_back_as_zero_stops_hard(self):
+        for readback, status in (('\\0  \\0   b  \\0', 0), ('', 0), ('0000000', 0), (ZEROS, 127)):
+            serial, writes, _ = self.remote(readback=readback, readback_status=status)
+            with self.assertRaises(InstallError) as raised: serial.clear_boot_flag('1'*32)
+            self.assertNotIsInstance(raised.exception, Unavailable)
+            self.assertEqual(self.kinds(writes), ['query', 'clear', 'readback'])
+            self.assertTrue(serial.cleared)
+
+    def test_a_write_that_is_never_answered_is_a_hard_stop_not_unavailable(self):
+        serial, writes, _ = self.remote(silent_after_write=True)
+        with patch('couch_serial.time.monotonic', side_effect=itertools.count()):
+            with self.assertRaises(InstallError) as raised: serial.clear_boot_flag('1'*32)
+        self.assertNotIsInstance(raised.exception, Unavailable)
+        self.assertEqual(self.kinds(writes), ['query', 'clear'])
+        self.assertTrue(serial.cleared)
+
+    def test_a_silent_remote_is_unavailable_and_nothing_is_written(self):
+        serial, writes, _ = self.remote()
+        serial.incoming = NS(read=lambda size, **kwargs: (_ for _ in ()).throw(TimeoutError()))
+        with patch('couch_serial.time.monotonic', side_effect=itertools.count()):
+            with self.assertRaises(Unavailable): serial.clear_boot_flag('1'*32)
+        self.assertEqual(self.kinds(writes), ['query'])
+        self.assertFalse(serial.cleared)
+
+    def test_the_echoed_command_is_never_read_as_its_answer(self):
+        serial, writes, _ = self.remote()
+        serial.clear_boot_flag('1'*32)
+        clear = next(w for w in writes if CLEAR_BCB in w)
+        marker = re.search(rb'COUCH-RECOVERY-[0-9a-f]{32}', clear).group()
+        self.assertNotIn(b'\n' + marker + b':BEGIN', clear)
+        self.assertNotIn(marker + b':0:END', clear)
 
 
 if __name__ == '__main__': unittest.main()

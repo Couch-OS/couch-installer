@@ -10,7 +10,9 @@
 //! (a read-only query), and restarts it only once the flag reads clear.
 //!
 //! Where the remote cannot be asked, the user restarts it by hand after
-//! confirming what its screen shows. Nothing here writes to the remote.
+//! confirming what its screen shows. The only write is on request, for a
+//! remote whose flag will not clear by itself: the recovery action's own
+//! clear and readback, after which it restarts straight into download mode.
 use crate::{
     adapter::Worker,
     frontend::{Choice, ProgressUnit, Ui},
@@ -230,6 +232,9 @@ pub trait CouchPort {
     fn identify(&mut self, bound: &Value, ui: &mut Ui) -> Result<Value>;
     /// The one-shot `couch_reboot`, which re-reads the CID before rebooting.
     fn reboot(&mut self, bound: &Value, cid: &str, ui: &mut Ui) -> Result<Value>;
+    /// The one-shot `couch_clear_flag`, which re-reads the CID and the flag
+    /// before clearing it.
+    fn clear(&mut self, bound: &Value, cid: &str, ui: &mut Ui) -> Result<Value>;
     fn pause(&mut self, duration: Duration);
 }
 impl CouchPort for Worker {
@@ -253,9 +258,70 @@ impl CouchPort for Worker {
             1,
         )
     }
+    fn clear(&mut self, bound: &Value, cid: &str, ui: &mut Ui) -> Result<Value> {
+        crate::orchestrator::simple(
+            self,
+            json!({"op":"couch_clear_flag","candidate":bound,"cid":cid}),
+            "couch_flag_cleared",
+            150,
+            ui,
+            1,
+        )
+    }
     fn pause(&mut self, duration: Duration) {
         std::thread::sleep(duration);
     }
+}
+
+/// What the worker's flag clear did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FlagCleared {
+    /// Written, read back as zeros and queried clear; carries the readback.
+    Cleared(String),
+    /// It was already clear, so nothing was written.
+    AlreadyClear,
+    /// The remote could not be asked before any write.
+    Unavailable(Reason),
+}
+pub fn flag_cleared(result: &Value) -> Result<FlagCleared> {
+    ensure!(
+        result["event"] == "couch_flag_cleared",
+        "unexpected Couch flag result"
+    );
+    Ok(match result["result"].as_str() {
+        Some("cleared") => {
+            ensure!(
+                keys(result) == ["event", "readback", "result"],
+                "invalid Couch flag result"
+            );
+            let readback = result["readback"].as_str().unwrap_or_default();
+            ensure!(
+                readback.len() <= 512 && !readback.chars().any(char::is_control),
+                "invalid Couch flag readback"
+            );
+            FlagCleared::Cleared(readback.into())
+        }
+        Some("already_clear") => {
+            ensure!(
+                keys(result) == ["event", "result"],
+                "invalid Couch flag result"
+            );
+            FlagCleared::AlreadyClear
+        }
+        Some("unavailable") => {
+            ensure!(
+                keys(result) == ["event", "reason", "result"],
+                "invalid Couch flag result"
+            );
+            FlagCleared::Unavailable(
+                result["reason"]
+                    .as_str()
+                    .and_then(Reason::parse)
+                    .context("invalid Couch flag reason")?,
+            )
+        }
+        _ => bail!("invalid Couch flag result"),
+    })
 }
 
 /// The storage ID the restarted remote must keep, and what was journaled.
@@ -452,16 +518,49 @@ fn not_ready(ui: &mut Ui) -> Result<bool> {
         "The remote is not ready yet",
         "The remote reports that it would start into COUCH RECOVERY next. That is normal for \
          about three minutes after Couch starts, and it is always the case while the screen \
-         shows COUCH RECOVERY.\n\nIf the screen shows COUCH RECOVERY, choose Stop, then run the \
-         installer again and choose My remote shows COUCH RECOVERY first. Otherwise wait until \
-         Couch has shown its normal screen for three minutes and check again. A remote that \
-         goes back to COUCH RECOVERY every time it starts cannot be reinstalled yet.\n\nNothing \
-         has been written and the remote has not been restarted.",
+         shows COUCH RECOVERY.\n\nWait until the remote has been on for three minutes, \
+         whichever screen it shows, and check again. If it still reports COUCH RECOVERY then, \
+         the installer offers to clear that and restart it straight into the installer.\n\n\
+         Nothing has been written and the remote has not been restarted.",
         &[
             choice("Check again", "Asks the remote again."),
             choice("Stop", "Leave the remote as it is."),
         ],
     )? == 0)
+}
+
+enum Stuck {
+    Clear,
+    CheckAgain,
+    Stop,
+}
+/// The remote has been up for three minutes and still starts COUCH RECOVERY
+/// next: it is in recovery, or its GUI never became healthy, and Couch will
+/// not clear the flag itself.
+fn stuck(ui: &mut Ui) -> Result<Stuck> {
+    Ok(
+        match ui.choose(
+            "The remote keeps starting into COUCH RECOVERY",
+            "Your remote keeps starting into COUCH RECOVERY. The installer can clear that and \
+             restart it straight into the installer.\n\nIt has been on for more than three \
+             minutes and still reports that it would start COUCH RECOVERY next, so Couch is not \
+             going to clear that itself. Clearing writes only the flag that sends it there, \
+             exactly as My remote shows COUCH RECOVERY does, and checks that it reads back \
+             clear.\n\nNothing has been written yet, and the remote has not been restarted.",
+            &[
+                choice(
+                    "Clear it and restart into the installer",
+                    "Clears the flag and checks it is clear; then the remote is restarted.",
+                ),
+                choice("Check again", "Asks the remote again."),
+                choice("Stop", "Leave the remote as it is."),
+            ],
+        )? {
+            0 => Stuck::Clear,
+            1 => Stuck::CheckAgain,
+            _ => Stuck::Stop,
+        },
+    )
 }
 
 /// Restart the remote over USB, re-checking its CID, or hand over to the user
@@ -542,7 +641,36 @@ pub fn restart(
                         wait_for_start(port, ui, observation.uptime.unwrap_or(0), seconds)?;
                         waited = true;
                     }
-                    Readiness::Stuck | Readiness::NotReady => {
+                    Readiness::Stuck => match stuck(ui)? {
+                        Stuck::Stop => bail!("{STOPPED}"),
+                        Stuck::CheckAgain => waited = false,
+                        Stuck::Clear => {
+                            let cid = observation.cid;
+                            port.pause(REOPEN_PAUSE);
+                            ui.progress(
+                                1,
+                                "Clearing the COUCH RECOVERY flag and checking it is clear",
+                                0,
+                                0,
+                            )?;
+                            let evidence = match flag_cleared(&port.clear(bound, &cid, ui)?)? {
+                                // Nothing was written; ask the remote again.
+                                FlagCleared::Unavailable(_) => {
+                                    waited = false;
+                                    continue;
+                                }
+                                FlagCleared::AlreadyClear => {
+                                    json!({"event":"recovery_flag_cleared_for_reinstall","usb":bound,"cid":cid,"result":"already_clear"})
+                                }
+                                FlagCleared::Cleared(readback) => {
+                                    json!({"event":"recovery_flag_cleared_for_reinstall","usb":bound,"cid":cid,"result":"cleared","readback":readback})
+                                }
+                            };
+                            session.checkpoint(&evidence)?;
+                            return request(port, bound, binding, session, ui);
+                        }
+                    },
+                    Readiness::NotReady => {
                         ensure!(not_ready(ui)?, "{STOPPED}");
                         waited = false;
                     }
@@ -667,6 +795,7 @@ pub(crate) mod tests {
     pub(crate) struct Script {
         pub(crate) answers: VecDeque<Value>,
         pub(crate) reboot: Option<Value>,
+        pub(crate) cleared: VecDeque<Value>,
         pub(crate) log: Vec<String>,
         pub(crate) paused: Duration,
     }
@@ -689,6 +818,12 @@ pub(crate) mod tests {
                 .reboot
                 .clone()
                 .unwrap_or(json!({"event":"couch_reboot","result":"requested"})))
+        }
+        fn clear(&mut self, _: &Value, cid: &str, _: &mut Ui) -> Result<Value> {
+            self.log.push(format!("clear {cid}"));
+            Ok(self.cleared.pop_front().unwrap_or(
+                json!({"event":"couch_flag_cleared","result":"cleared","readback":"\\0  \\0"}),
+            ))
         }
         fn pause(&mut self, duration: Duration) {
             self.paused += duration;
@@ -917,7 +1052,7 @@ pub(crate) mod tests {
     fn an_armed_flag_on_a_remote_up_three_minutes_is_not_restarted() {
         // Stop: nothing is restarted and the installation stops.
         let (_root, mut session) = private_session();
-        let (mut ui, screen) = terminal(&["1"]);
+        let (mut ui, screen) = terminal(&["2"]);
         let mut remote = Script::with(vec![observed(CID, FLAG_ARMED_SHA256, Some(600))]);
         let error = restart(
             &mut remote,
@@ -932,14 +1067,20 @@ pub(crate) mod tests {
         assert_eq!(remote.log, ["identify"]);
         assert_eq!(remote.paused, Duration::ZERO);
         let prompts = screen.prompts();
-        assert_eq!(prompts[0].0, "The remote is not ready yet");
-        assert!(
-            prompts[0].2.contains("cannot be reinstalled yet"),
-            "{}",
-            prompts[0].2
+        assert_eq!(
+            prompts[0].0,
+            "The remote keeps starting into COUCH RECOVERY"
+        );
+        assert_eq!(
+            prompts[0].3,
+            [
+                "Clear it and restart into the installer",
+                "Check again",
+                "Stop"
+            ]
         );
         // Check again: asked afresh, restarted once it reads clear.
-        let (mut ui, _) = terminal(&["0"]);
+        let (mut ui, _) = terminal(&["1"]);
         let mut remote = Script::with(vec![
             observed(CID, FLAG_ARMED_SHA256, Some(600)),
             observed(CID, FLAG_CLEAR_SHA256, Some(700)),
@@ -954,6 +1095,153 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(remote.log.len(), 3);
+    }
+
+    #[test]
+    fn a_remote_stuck_in_recovery_is_cleared_and_restarted_straight_into_the_installer() {
+        let (_root, mut session) = private_session();
+        let (mut ui, screen) = terminal(&["0"]);
+        let mut remote = Script::with(vec![observed(CID, FLAG_ARMED_SHA256, Some(600))]);
+        restart(
+            &mut remote,
+            &port(),
+            &mut CouchBinding::enrolled(CID),
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(
+            remote.log,
+            [
+                "identify".to_string(),
+                format!("clear {CID}"),
+                format!("reboot {CID}")
+            ]
+        );
+        // Re-opening the serial function waits before the clear and the reboot.
+        assert_eq!(remote.paused, REOPEN_PAUSE * 2);
+        assert_eq!(screen.prompts().len(), 1);
+        let events = journal(&session);
+        let tail: Vec<_> = events[events.len() - 2..]
+            .iter()
+            .map(|e| e["event"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            tail,
+            ["recovery_flag_cleared_for_reinstall", "couch_restart"]
+        );
+        assert_eq!(events[events.len() - 2]["result"], "cleared");
+        assert_eq!(events[events.len() - 2]["cid"], CID);
+    }
+
+    #[test]
+    fn a_clear_that_could_not_reach_the_remote_asks_again_and_one_already_clear_restarts() {
+        let (_root, mut session) = private_session();
+        let (mut ui, _) = terminal(&["0", "2"]);
+        let mut remote = Script::with(vec![
+            observed(CID, FLAG_ARMED_SHA256, Some(600)),
+            observed(CID, FLAG_ARMED_SHA256, Some(610)),
+        ]);
+        remote.cleared.push_back(
+            json!({"event":"couch_flag_cleared","result":"unavailable","reason":"no_answer"}),
+        );
+        let error = restart(
+            &mut remote,
+            &port(),
+            &mut CouchBinding::enrolled(CID),
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), STOPPED);
+        assert_eq!(
+            remote.log,
+            [
+                "identify".to_string(),
+                format!("clear {CID}"),
+                "identify".into()
+            ]
+        );
+        let (mut ui, _) = terminal(&["0"]);
+        let mut remote = Script::with(vec![observed(CID, FLAG_ARMED_SHA256, Some(600))]);
+        remote
+            .cleared
+            .push_back(json!({"event":"couch_flag_cleared","result":"already_clear"}));
+        restart(
+            &mut remote,
+            &port(),
+            &mut CouchBinding::enrolled(CID),
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(remote.log.last().unwrap(), &format!("reboot {CID}"));
+        assert_eq!(
+            journal(&session)
+                .iter()
+                .rev()
+                .find(|e| e["event"] == "recovery_flag_cleared_for_reinstall")
+                .unwrap()["result"],
+            "already_clear"
+        );
+    }
+
+    #[test]
+    fn a_young_remote_still_armed_after_the_wait_is_not_offered_the_clear() {
+        let (_root, mut session) = private_session();
+        let (mut ui, screen) = terminal(&["1"]);
+        let mut remote = Script::with(vec![
+            observed(CID, FLAG_ARMED_SHA256, Some(100)),
+            observed(CID, FLAG_ARMED_SHA256, Some(30)),
+        ]);
+        assert!(restart(
+            &mut remote,
+            &port(),
+            &mut CouchBinding::enrolled(CID),
+            false,
+            &mut session,
+            &mut ui,
+        )
+        .is_err());
+        let prompts = screen.prompts();
+        assert_eq!(prompts[0].0, "The remote is not ready yet");
+        assert_eq!(prompts[0].3, ["Check again", "Stop"]);
+        assert!(!remote.log.iter().any(|entry| entry.starts_with("clear")));
+    }
+
+    #[test]
+    fn flag_clear_results_are_parsed_exactly() {
+        assert_eq!(
+            flag_cleared(
+                &json!({"event":"couch_flag_cleared","result":"cleared","readback":"\\0"})
+            )
+            .unwrap(),
+            FlagCleared::Cleared("\\0".into())
+        );
+        assert_eq!(
+            flag_cleared(&json!({"event":"couch_flag_cleared","result":"already_clear"})).unwrap(),
+            FlagCleared::AlreadyClear
+        );
+        assert_eq!(
+            flag_cleared(
+                &json!({"event":"couch_flag_cleared","result":"unavailable","reason":"absent"})
+            )
+            .unwrap(),
+            FlagCleared::Unavailable(Reason::Absent)
+        );
+        for bad in [
+            json!({"event":"couch_flag_cleared","result":"cleared"}),
+            json!({"event":"couch_flag_cleared","result":"cleared","readback":"x\ny"}),
+            json!({"event":"couch_flag_cleared","result":"already_clear","readback":""}),
+            json!({"event":"couch_flag_cleared","result":"unavailable","reason":"later"}),
+            json!({"event":"couch_flag_cleared","result":"written"}),
+            json!({"event":"couch_reboot","result":"requested"}),
+        ] {
+            assert!(flag_cleared(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

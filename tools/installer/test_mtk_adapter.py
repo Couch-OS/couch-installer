@@ -306,6 +306,61 @@ raise SystemExit(serve_stdio(Fixture))
         with self.assertRaises(InstallError):
             adapter.dispatch({'op': 'couch_identify', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
 
+    def clearing_serial(self, outcomes, opened):
+        class FakeSerial:
+            def __init__(self, usb, backend, selected, *, serial_port=None):
+                opened.append(serial_port)
+                self.cleared = False
+            def clear_boot_flag(self, cid):
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                self.cleared = outcome is not None
+                return outcome
+            def close(self):
+                opened.append('closed')
+        return FakeSerial
+
+    def test_couch_clear_flag_reports_each_outcome_and_writes_at_most_once(self):
+        adapter, wire = self.bind_adapter([])
+        opened = []
+        command = {'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16}
+        with patch('mtk_adapter.CouchSerial', self.clearing_serial(
+                [Unavailable('cannot_open'), None, '\\0  \\0'], opened)), \
+                patch('mtk_adapter.couch_query_port', return_value=open_couch_port):
+            for _ in range(3):
+                adapter.dispatch(command)
+            # Nothing written yet by the first two, so they did not consume it;
+            # the third wrote, so a fourth is refused.
+            with self.assertRaises(InstallError):
+                adapter.dispatch(command)
+        results = [event for event in wire.events if isinstance(event, dict)]
+        self.assertEqual(results, [
+            {'event': 'couch_flag_cleared', 'result': 'unavailable', 'reason': 'cannot_open'},
+            {'event': 'couch_flag_cleared', 'result': 'already_clear'},
+            {'event': 'couch_flag_cleared', 'result': 'cleared', 'readback': '\\0  \\0'}])
+        # The clear goes the way the query does: the COM port on Windows.
+        self.assertEqual(opened.count(open_couch_port), 3)
+        self.assertEqual(opened.count('closed'), 3)
+        self.assertEqual(wire.events.count(('deadline', 120)), 3)
+
+    def test_couch_clear_flag_is_refused_after_the_reboot_or_download_mode(self):
+        adapter, wire = self.bind_adapter([])
+        with patch('mtk_adapter.CouchSerial', self.couch_serial([], [], [])):
+            adapter.dispatch({'op': 'couch_reboot', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+        with patch('mtk_adapter.CouchSerial', self.clearing_serial(['x'], [])):
+            with self.assertRaises(InstallError):
+                adapter.dispatch({'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+        adapter, wire = self.bind_adapter([])
+        adapter.reader = object()
+        with patch('mtk_adapter.CouchSerial', self.clearing_serial(['x'], [])):
+            with self.assertRaises(InstallError):
+                adapter.dispatch({'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+            adapter, wire = self.bind_adapter([])
+            with self.assertRaises(InstallError):
+                adapter.dispatch({'op': 'couch_clear_flag', 'candidate': self.COUCH_PORT})
+        self.assertEqual(wire.events, [])
+
     def test_only_the_windows_identity_query_uses_the_com_port(self):
         self.assertIs(couch_query_port('win32'), open_couch_port)
         self.assertIsNone(couch_query_port('darwin'))

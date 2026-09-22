@@ -41,11 +41,11 @@ def couch_candidate(raw):
 
 
 def couch_query_port(platform=sys.platform):
-    """How the read-only identity query reaches Couch's serial function.
+    """How the identity query and the flag clear reach Couch's serial function.
 
-    Windows binds its serial-port driver to it, so the query goes through that
-    COM port, found by physical port chain as the RAM stage's is. The reboot
-    keeps its libusb-only route, so on Windows it stays a manual restart.
+    Windows binds its serial-port driver to it, so they go through that COM
+    port, found by physical port chain as the RAM stage's is. The reboot keeps
+    its libusb-only route, so on Windows it stays a manual restart.
     """
     return open_couch_port if platform == 'win32' else None
 
@@ -257,6 +257,31 @@ class Adapter:
                 event = {'event': 'couch_identity', 'result': 'unavailable', 'reason': unavailable.reason}
             finally:
                 if serial is not None:
+                    serial.close()
+            self.wire.send(event)
+        elif op == 'couch_clear_flag':
+            # The one write before download mode: clear a recovery flag that
+            # will not clear by itself, only after this session's own query
+            # shows the expected CID and exactly the armed value. At most once
+            # per worker, never after the reboot or the download-agent start.
+            require(set(command) == {'op', 'candidate', 'cid'} and self.backend is not None
+                    and self.reader is None and not getattr(self, 'couch_reboot_consumed', False)
+                    and not getattr(self, 'couch_clear_consumed', False), 'Invalid Couch flag clear state')
+            selected = couch_candidate(command['candidate'])
+            serial = None
+            try:
+                with self.wire.deadline(120):
+                    serial = CouchSerial(self.backend.usb, self.backend.usb_backend, selected,
+                                         serial_port=couch_query_port())
+                    readback = serial.clear_boot_flag(command['cid'])
+                event = ({'event': 'couch_flag_cleared', 'result': 'already_clear'} if readback is None
+                         else {'event': 'couch_flag_cleared', 'result': 'cleared', 'readback': readback})
+            except Unavailable as unavailable:
+                event = {'event': 'couch_flag_cleared', 'result': 'unavailable', 'reason': unavailable.reason}
+            finally:
+                if serial is not None:
+                    if serial.cleared:
+                        self.couch_clear_consumed = True
                     serial.close()
             self.wire.send(event)
         elif op == 'couch_reboot':

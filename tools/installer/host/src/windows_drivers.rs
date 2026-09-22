@@ -188,7 +188,7 @@ pub fn describe_couch(inventory: &Inventory) -> String {
 }
 
 #[cfg(windows)]
-pub use registry::inventory;
+pub use registry::{inventory, serial_ports};
 
 #[cfg(windows)]
 mod registry {
@@ -316,6 +316,55 @@ mod registry {
                 })
             })
             .collect()
+    }
+
+    /// Every key under `Enum\USB` that belongs to one vendor/product pair: the
+    /// device itself and, for a composite device, its `MI_xx` functions.
+    fn device_keys(pid: u16) -> Result<Vec<String>> {
+        let device_key = registry_key(pid);
+        let mut keys = vec![device_key.clone()];
+        if let Some(usb) = open(ENUM_USB)? {
+            let prefix = format!("{}&MI_", &device_key["USB\\".len()..]).to_ascii_uppercase();
+            for name in subkeys(&usb)? {
+                if name.to_ascii_uppercase().starts_with(&prefix) {
+                    keys.push(format!(r"USB\{name}"));
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Read the COM ports Windows' serial-port driver created for one
+    /// vendor/product pair.
+    ///
+    /// The port name lives under the instance's `Device Parameters`, which is
+    /// where `usbser` records it and where every serial-port enumerator reads
+    /// it. `Enum` also keeps instances that are not currently attached, so an
+    /// instance is reported as started only when Windows has published its
+    /// volatile `Control` key, which exists only while the device is running.
+    pub fn serial_ports(pid: u16) -> Result<Vec<crate::recovery::SerialPortRecord>> {
+        let mut ports = Vec::new();
+        for key in device_keys(pid)? {
+            let path = format!(r"SYSTEM\CurrentControlSet\Enum\{key}");
+            let Some(parent) = open(&path)? else {
+                continue;
+            };
+            for id in subkeys(&parent)? {
+                let instance = format!(r"{path}\{id}");
+                let Some(parameters) = open(&format!(r"{instance}\Device Parameters"))? else {
+                    continue;
+                };
+                let Some(port) = string_value(&parameters, "PortName")? else {
+                    continue;
+                };
+                ports.push(crate::recovery::SerialPortRecord {
+                    instance: format!(r"{}\{id}", &key["USB\\".len()..]),
+                    port,
+                    started: open(&format!(r"{instance}\Control"))?.is_some(),
+                });
+            }
+        }
+        Ok(ports)
     }
 
     /// Read every device and interface instance Windows has recorded for the

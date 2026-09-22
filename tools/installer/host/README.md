@@ -150,6 +150,74 @@ bounded claim failure; it does not replace drivers for other USB devices. See
 Fresh Android enrollment, OS startup, restoration and reinstall from another
 computer need separate physical acceptance records before a public-ready claim.
 
+### Leaving Couch recovery
+
+**My remote shows COUCH RECOVERY** is a first-menu action for a remote that
+starts into recovery on every boot. It needs no release configuration, no
+downloads, no Python worker and no administrator rights: `recovery` runs
+entirely in this crate, and the orchestrator dispatches it before anything the
+installation flow requires. A runtime candidate that failed its health check on
+an image with an older bootstrap is rolled back correctly but leaves
+`boot-recovery` armed in the bootloader control block, and recovery keeps that
+flag on purpose, so every following boot returns there.
+
+`recovery::discover` resolves the recovery USB identity `0e8d:201c` to the
+serial port the operating system created for its CDC ACM function, through that
+system's own record and never by guessing from a port name:
+
+- **macOS** reads `ioreg -a -l -r -c IOUSBHostDevice` and walks the device whose
+  `idVendor`/`idProduct` match, taking the single `IOCalloutDevice` in its
+  subtree; `locationID` gives the bus and hub port chain, decoded exactly as the
+  Python callout transport does. Empty output means no USB device, not an error.
+- **Linux** reads `/sys/bus/usb/devices`, matching `idVendor`/`idProduct` and
+  taking the single `tty/` entry across that device's interfaces, with `busnum`
+  and `devpath` as the location.
+- **Windows** reads the device instances under
+  `HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_0E8D&PID_201C[&MI_xx]` with the
+  same registry reader as the driver pre-flight, takes the instance's
+  `Device Parameters\PortName`, and prefers instances Windows currently reports
+  as started (a volatile `Control` key). Nothing binds or replaces a driver.
+
+More than one candidate, or a device the host has not given exactly one serial
+port, refuses and asks for the others to be disconnected. The action never
+chooses a remote, and discovery happens once.
+
+`recovery::shell` then proves the port really is a Couch recovery shell before
+anything is written. That shell is `busybox sh` run non-interactively on the USB
+gadget, so it prints no prompt; every command is framed by a per-session random
+marker that only ever reaches the remote inside a `printf` format argument, so
+the tty's echo can never be read as an answer. The read-only probes are
+`cat /proc/cmdline` (must carry the HA100 boot image command line),
+`test -f /mnt/alpine/opt/couch/stage2.sh` (recovery's own test that the Couch
+filesystem is mounted where only recovery mounts it),
+`readlink /mnt/alpine/opt/couch/runtime/current` (`slots/<sha256>`, or absent
+for the base runtime), `test -b /dev/mmcblk0p10` and
+`cat /sys/block/mmcblk0/device/cid`. Any answer that does not match refuses with
+a plain message and nothing is written.
+
+On explicit confirmation it sends, in this order and nothing else:
+
+```sh
+dd if=/dev/zero of=/dev/mmcblk0p10 bs=512 count=1 conv=notrunc; sync
+dd if=/dev/mmcblk0p10 bs=512 count=1 2>/dev/null | od -An -c | head -1
+reboot -f
+```
+
+`reboot -f` is issued only after that readback printed a line of nothing but
+NUL bytes. A readback that does not, or a readback command that fails, stops
+with the remote left in recovery and says so; there is no second attempt. Only
+the first 512 bytes of `para` are written, so the `ENV_v1` area at 128 KiB is
+preserved, and no other partition is named by any command in the module.
+
+The run takes the same private state root and device-wide USB lock as an
+installation, and journals the bound location, the storage CID, the slot the
+next boot will select and the accepted readback. Detection, probe parsing,
+every refusal and the command order are unit-tested on all three platforms with
+fixtures and a fake serial endpoint, and the entrypoint test drives the real
+per-platform search with no device attached. None of that is a hardware run:
+clearing the flag on an actual remote in recovery remains a separate physical
+acceptance.
+
 ### Offline owner-image assembly acceptance
 
 Before a release reaches USB testing, exercise the actual public archive with

@@ -2,7 +2,7 @@
 //! the Python worker is restricted to MTK and bounded USB setup transport.
 use crate::{
     adapter::{self, UsbLease, Worker},
-    android, assembly, dependencies, enrollment, enrollment_sources,
+    android, assembly, couch_restart, dependencies, enrollment, enrollment_sources,
     frontend::{Choice, Ui},
     network,
     public_inputs::{self, create, decode, digest, hex},
@@ -111,7 +111,7 @@ pub(crate) fn state_root() -> Result<PathBuf> {
     }
     Ok(path)
 }
-fn simple(
+pub(crate) fn simple(
     worker: &mut Worker,
     command: Value,
     event: &str,
@@ -152,39 +152,6 @@ fn prepared_worker(
         1,
     )?;
     Ok(worker)
-}
-/// Ask a running Couch to restart through its USB serial and, when that is
-/// unavailable, have the user do it by hand.
-fn couch_restart(
-    worker: &mut Worker,
-    bound: &Value,
-    expected_cid: &str,
-    session: &mut SessionGuard,
-    ui: &mut Ui,
-) -> Result<()> {
-    ui.progress(
-        1,
-        "Checking Couch identity and requesting USB restart",
-        0,
-        0,
-    )?;
-    let restart = simple(
-        worker,
-        json!({"op":"couch_reboot","candidate":bound,"cid":expected_cid}),
-        "couch_reboot",
-        20,
-        ui,
-        1,
-    ).context("Couch USB identity/restart failed or its delivery is ambiguous; no automatic retry was attempted")?;
-    session.checkpoint(&json!({"event":"couch_restart","usb":bound,"result":restart["result"]}))?;
-    match restart["result"].as_str() {
-        Some("requested") => {}
-        Some("unavailable") => {
-            ui.choose("Restart the selected remote", "USB serial restart is unavailable; no reboot command was sent. Keep USB connected. After Continue, hold the side Power button until the remote turns off, then release it. If needed, hold Power until it starts again.",&[choice("Continue and watch USB","Only the selected physical USB port can be captured.")])?;
-        }
-        _ => anyhow::bail!("Invalid Couch restart result"),
-    }
-    Ok(())
 }
 /// Wait for the selected physical port to show a download-mode identity, then
 /// start the read-only download-agent session on it. Nothing is written here.
@@ -685,6 +652,9 @@ fn install(
     let script = adapter::materialize(session)?;
     let session_dir = session.path().to_path_buf();
     let mut worker = prepared_worker(&dependencies, &script, &prepared, &session_dir, ui)?;
+    // Every Couch restart, first attempt and retry, waits until the remote
+    // reports the enrolled CID and a normal next start.
+    let mut binding = couch_restart::CouchBinding::enrolled(&expected_cid);
     let bound = if let Some(serial) = &serial {
         // The ADB server must not hold the remote while the worker reads its
         // USB serial descriptor (issue #89, Windows). Reboot restarts it.
@@ -738,7 +708,7 @@ fn install(
             let selected=ui.choose("Select the connected Couch remote","Its stored CID and calibration must match the imported enrollment before any write.",&options)?;
             break candidates[selected].clone();
         };
-        couch_restart(&mut worker, &bound, &expected_cid, session, ui)?;
+        couch_restart::restart(&mut worker, &bound, &mut binding, false, session, ui)?;
         bound
     };
     let mut attempt = 1u32;
@@ -781,7 +751,7 @@ fn install(
             dependencies.verify()?;
             android::reboot(&dependencies.adb, serial)?;
         } else {
-            couch_restart(&mut worker, &bound, &expected_cid, session, ui)?;
+            couch_restart::restart(&mut worker, &bound, &mut binding, true, session, ui)?;
         }
     };
     let cid = connected["cid"]

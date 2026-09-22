@@ -4,6 +4,7 @@ pub mod android;
 pub mod android_images;
 pub mod android_restore;
 pub mod assembly;
+pub mod couch_restart;
 pub mod dependencies;
 pub mod enrollment;
 pub mod enrollment_sources;

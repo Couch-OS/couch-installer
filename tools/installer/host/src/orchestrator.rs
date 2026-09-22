@@ -478,6 +478,43 @@ fn download_agent_cid(expected: Option<&str>, observed: &str, fresh: bool) -> Re
         }
     }
 }
+/// After a calibration-only mismatch, the other saved enrollments on this
+/// computer for the same remote, and whether each matches it as it is now.
+/// Read without verification and shown as hints only: whichever the operator
+/// picks next time is imported and checked in full.
+fn same_remote_hints(
+    others: &[(String, saved_enrollment::Peek)],
+    observed: &saved_enrollment::ObservedHardware,
+) -> String {
+    let same: Vec<_> = others
+        .iter()
+        .filter(|(_, peek)| peek.cid == observed.cid)
+        .map(|(label, peek)| {
+            let matches = peek.capacity == observed.capacity
+                && peek.identity_sha256 == observed.identity_sha256;
+            format!(
+                "{label} ({})",
+                if matches {
+                    "matches this remote now"
+                } else {
+                    "does not match"
+                }
+            )
+        })
+        .collect();
+    if same.is_empty() {
+        " No other saved enrollment on this computer is for this remote. A folder with a \
+         different storage ID belongs to another remote."
+            .into()
+    } else {
+        format!(
+            " Other saved enrollments for this remote on this computer: {}. Run the installer \
+             again and pick one that matches this remote now; it is checked again in full. A \
+             folder with a different storage ID belongs to another remote.",
+            same.join("; ")
+        )
+    }
+}
 /// The remote in download mode is not the one the serial query bound.
 const OTHER_DOWNLOAD_REMOTE: &str = "The remote in download mode is not the one that was checked \
      over USB before the restart (its storage ID differs). Nothing was written. Hold the side \
@@ -1035,7 +1072,38 @@ fn install(
                 .collect(),
             retained_sha256: originals.clone(),
         };
-        let proof = saved.rebind_mode(&observation, session, restore)?;
+        let changed = saved.calibration_only_mismatch(&observation);
+        let rejected = saved.sha256().to_owned();
+        let proof = match saved.rebind_mode(&observation, session, restore) {
+            Ok(proof) => proof,
+            Err(error) => {
+                // The remote is left in download mode. When only calibration
+                // changed (Android started again after the folder was saved),
+                // point at any other folder for this remote that matches it now.
+                let hints = match &changed {
+                    Some(changed) => {
+                        session.checkpoint(&json!({"event":"imported_enrollment_rejected","enrollment_sha256":rejected,"calibration_changed":changed}))?;
+                        let others: Vec<_> = enrollment_sources::discover(&state_root, None)
+                            .into_iter()
+                            .filter(|candidate| {
+                                chosen_folder
+                                    .as_deref()
+                                    .is_none_or(|picked| candidate.path != picked)
+                            })
+                            .filter_map(|candidate| {
+                                Some((candidate.label(), saved_enrollment::peek(&candidate.path)?))
+                            })
+                            .collect();
+                        same_remote_hints(&others, &observation)
+                    }
+                    None => String::new(),
+                };
+                anyhow::bail!(
+                    "{error:#}. Nothing was written. Hold the side Power button until the remote \
+                     turns off, then start it again.{hints}"
+                );
+            }
+        };
         // Only now, imported in full and bound to this remote, is the folder
         // worth offering first next time. A folder that fails the rebind is
         // not remembered, so it cannot keep coming back at the top.
@@ -1516,6 +1584,55 @@ mod tests {
             assert!(body.contains("The installer never writes calibration."));
             assert!(body.contains("choose Install with Android backup instead"));
         }
+    }
+
+    #[test]
+    fn a_stale_enrollment_points_at_the_saved_one_that_matches_this_remote_now() {
+        let cid = "12".repeat(16);
+        let calibration = |value: &str| -> BTreeMap<String, String> {
+            enrollment::IDENTITY
+                .into_iter()
+                .map(|name| (name.to_string(), value.repeat(64)))
+                .collect()
+        };
+        let observed = saved_enrollment::ObservedHardware {
+            cid: cid.clone(),
+            capacity: 4096,
+            hwcode: 0x6580,
+            cid_encoding: "mt6580-legacy-le32-registers".into(),
+            partitions: BTreeMap::new(),
+            identity_sha256: calibration("b"),
+            retained_sha256: BTreeMap::new(),
+        };
+        let peek = |cid: &str, value: &str| saved_enrollment::Peek {
+            cid: cid.into(),
+            capacity: 4096,
+            identity_sha256: calibration(value),
+        };
+        let others = vec![
+            (
+                "Saved 2026-09-13 06:50 UTC · install-a2ba".to_string(),
+                peek(&cid, "b"),
+            ),
+            (
+                "Saved 2026-09-12 22:10 UTC · install-05f5".to_string(),
+                peek(&cid, "a"),
+            ),
+            (
+                "Saved 2026-09-01 10:00 UTC · install-9999".to_string(),
+                peek(&"34".repeat(16), "b"),
+            ),
+        ];
+        let hints = same_remote_hints(&others, &observed);
+        assert!(
+            hints.contains("install-a2ba (matches this remote now)"),
+            "{hints}"
+        );
+        assert!(hints.contains("install-05f5 (does not match)"), "{hints}");
+        assert!(!hints.contains("install-9999"), "{hints}");
+        assert!(hints.contains("belongs to another remote"));
+        let none = same_remote_hints(&others[2..], &observed);
+        assert!(none.contains("No other saved enrollment on this computer is for this remote"));
     }
 
     #[test]

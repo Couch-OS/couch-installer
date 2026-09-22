@@ -675,6 +675,10 @@ mod tests {
         assert_eq!(describe(1, &[]), "USB bus 1");
     }
 
+    // A sysfs interface directory is named "<device>:<configuration>.<n>", and
+    // Windows cannot create a file whose name contains a colon, so the fixture
+    // tree for the Linux reader exists only where sysfs itself could.
+    #[cfg(unix)]
     fn sysfs(devices: &Path, name: &str, vendor: &str, product: &str, ttys: &[(&str, &str)]) {
         let directory = devices.join(name);
         std::fs::create_dir_all(&directory).unwrap();
@@ -693,6 +697,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn linux_resolves_the_recovery_identity_to_its_own_tty() {
         let root = tempfile::tempdir().unwrap();
         let devices = root.path();
@@ -710,6 +715,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn linux_reports_two_connected_remotes_separately() {
         let root = tempfile::tempdir().unwrap();
         let devices = root.path();
@@ -719,6 +725,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn linux_refuses_a_remote_without_exactly_one_tty() {
         for interfaces in [
             [].as_slice(),

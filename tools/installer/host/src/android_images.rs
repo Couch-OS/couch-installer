@@ -221,13 +221,35 @@ pub fn boot_kind(image: &[u8]) -> BootKind {
     }
 }
 
-/// What a reinstall without a saved enrollment makes of the remote's current
-/// boot, recovery and overlay, before anything is written.
+/// The installer's own RAM stage: Couch's shape plus the stage's service.
+/// Every stage the installer builds carries it and no Couch boot or recovery
+/// does, so boot holding it means an earlier installation stopped after
+/// writing its stage and before writing boot.
+pub fn installer_stage(image: &[u8]) -> bool {
+    couch_boot(image).is_ok()
+        && ramdisk(image, "image").is_ok_and(|archive| {
+            cpio_entries(&archive).is_ok_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.name == STAGE_SERVICE && entry.regular())
+            })
+        })
+}
+const STAGE_SERVICE: &str = "bin/couch-installer-probe";
+
+/// A remote whose boot, recovery and overlay a reinstall without a saved
+/// enrollment admits as Couch's.
 #[derive(Debug, PartialEq, Eq)]
-pub enum CouchImages {
-    /// Boot and recovery are Couch's and the overlay is MediaTek's. Carries
-    /// the evidence string recorded in the journal.
-    Couch(&'static str),
+pub struct CouchImages {
+    /// Recorded in the journal.
+    pub evidence: &'static str,
+    /// Boot holds the installer's RAM stage beside Couch's recovery: an
+    /// earlier installation stopped halfway, after writing recovery.
+    pub stage_in_boot: bool,
+}
+/// Why a reinstall without a saved enrollment refuses the remote's images.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
     /// Boot is stock Android: the remote runs Android.
     AndroidBoot,
     /// Recovery is stock Android: the remote was last running Android, even
@@ -236,23 +258,26 @@ pub enum CouchImages {
     /// Neither Couch nor Android, or a foreign overlay; names the failed check.
     Unrecognised(String),
 }
-impl CouchImages {
-    /// Journal reason for a refusal.
+impl Refusal {
+    /// Journal reason.
     pub fn reason(&self) -> &'static str {
         match self {
-            CouchImages::Couch(_) => "couch",
-            CouchImages::AndroidBoot => "android_boot",
-            CouchImages::AndroidRecovery => "android_recovery",
-            CouchImages::Unrecognised(_) => "unrecognised",
+            Refusal::AndroidBoot => "android_boot",
+            Refusal::AndroidRecovery => "android_recovery",
+            Refusal::Unrecognised(_) => "unrecognised",
         }
     }
 }
-pub fn couch_images(boot: &[u8], recovery: &[u8], overlay: &[u8]) -> CouchImages {
+pub fn couch_images(
+    boot: &[u8],
+    recovery: &[u8],
+    overlay: &[u8],
+) -> std::result::Result<CouchImages, Refusal> {
     if android_boot(boot).is_ok() {
-        return CouchImages::AndroidBoot;
+        return Err(Refusal::AndroidBoot);
     }
     if android_boot(recovery).is_ok() {
-        return CouchImages::AndroidRecovery;
+        return Err(Refusal::AndroidRecovery);
     }
     for (name, check) in [
         ("boot", couch_boot(boot)),
@@ -260,10 +285,20 @@ pub fn couch_images(boot: &[u8], recovery: &[u8], overlay: &[u8]) -> CouchImages
         ("odmdtbo", mediatek_overlay(overlay)),
     ] {
         if let Err(error) = check {
-            return CouchImages::Unrecognised(format!("{name}: {error:#}"));
+            return Err(Refusal::Unrecognised(format!("{name}: {error:#}")));
         }
     }
-    CouchImages::Couch("couch-boot-image+couch-recovery-image+mediatek-overlay")
+    Ok(if installer_stage(boot) {
+        CouchImages {
+            evidence: "couch-installer-stage+couch-recovery-image+mediatek-overlay",
+            stage_in_boot: true,
+        }
+    } else {
+        CouchImages {
+            evidence: "couch-boot-image+couch-recovery-image+mediatek-overlay",
+            stage_in_boot: false,
+        }
+    })
 }
 
 /// A MediaTek dtbo container with a flattened device tree at 0x400 that names
@@ -545,31 +580,39 @@ mod tests {
         let couch = |boot: &[u8], recovery: &[u8]| couch_images(boot, recovery, &overlay);
         assert_eq!(
             couch(&fixtures::couch_boot(), &fixtures::couch_recovery()),
-            CouchImages::Couch("couch-boot-image+couch-recovery-image+mediatek-overlay")
+            Ok(CouchImages {
+                evidence: "couch-boot-image+couch-recovery-image+mediatek-overlay",
+                stage_in_boot: false
+            })
         );
-        // A Couch remote stuck mid-install still has Couch recovery: repairable.
-        assert!(matches!(
+        // A remote stuck mid-install still has Couch recovery: admitted, and
+        // marked, because an Android remote whose install stopped after the
+        // recovery write looks the same and still holds Android's userdata.
+        assert_eq!(
             couch(&fixtures::stage(), &fixtures::couch_recovery()),
-            CouchImages::Couch(_)
-        ));
+            Ok(CouchImages {
+                evidence: "couch-installer-stage+couch-recovery-image+mediatek-overlay",
+                stage_in_boot: true
+            })
+        );
         // The same stage beside Android's recovery is an Android remote whose
         // install stopped after the boot write: refused, or Android would lose
         // its data with no backup.
         assert_eq!(
             couch(&fixtures::stage(), &fixtures::android_recovery()),
-            CouchImages::AndroidRecovery
+            Err(Refusal::AndroidRecovery)
         );
         assert_eq!(
             couch(&fixtures::android_boot(), &fixtures::android_recovery()),
-            CouchImages::AndroidBoot
+            Err(Refusal::AndroidBoot)
         );
         assert_eq!(
             couch(&fixtures::android_boot(), &fixtures::couch_recovery()),
-            CouchImages::AndroidBoot
+            Err(Refusal::AndroidBoot)
         );
         assert_eq!(
             couch(&fixtures::couch_boot(), &fixtures::android_recovery()),
-            CouchImages::AndroidRecovery
+            Err(Refusal::AndroidRecovery)
         );
         for (boot, recovery, check) in [
             (vec![0; PARTITION_SIZE], fixtures::couch_recovery(), "boot:"),
@@ -581,7 +624,7 @@ mod tests {
             ),
         ] {
             match couch(&boot, &recovery) {
-                CouchImages::Unrecognised(detail) => {
+                Err(Refusal::Unrecognised(detail)) => {
                     assert!(detail.starts_with(check), "{detail}")
                 }
                 other => panic!("{other:?}"),
@@ -591,9 +634,36 @@ mod tests {
             &fixtures::couch_boot(),
             &fixtures::couch_recovery(),
             &fixtures::overlay_with(b"qcom,sdm845\0"),
-        );
-        assert!(matches!(&foreign, CouchImages::Unrecognised(d) if d.starts_with("odmdtbo:")));
+        )
+        .unwrap_err();
+        assert!(matches!(&foreign, Refusal::Unrecognised(d) if d.starts_with("odmdtbo:")));
         assert_eq!(foreign.reason(), "unrecognised");
-        assert_eq!(CouchImages::AndroidRecovery.reason(), "android_recovery");
+        assert_eq!(Refusal::AndroidRecovery.reason(), "android_recovery");
+    }
+
+    #[test]
+    fn only_the_installer_stage_is_taken_for_one() {
+        assert!(installer_stage(&fixtures::stage()));
+        for image in [
+            fixtures::couch_boot(),
+            fixtures::couch_recovery(),
+            fixtures::android_boot(),
+            vec![0; PARTITION_SIZE],
+            // The service name beside Android's init.rc is not a stage.
+            fixtures::boot_with(&[
+                ("init", b"#!/bin/busybox sh\n"),
+                ("bin/busybox", b"\x7fELF"),
+                ("bin/couch-installer-probe", b"\x7fELF"),
+                ("init.rc", b"on init\n"),
+            ]),
+            // Nor is a directory of that name.
+            fixtures::boot_with_modes(&[
+                ("init", 0o100755, b"#!/bin/busybox sh\n"),
+                ("bin/busybox", 0o100755, b"\x7fELF"),
+                ("bin/couch-installer-probe", 0o040755, b""),
+            ]),
+        ] {
+            assert!(!installer_stage(&image));
+        }
     }
 }

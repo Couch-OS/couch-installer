@@ -166,8 +166,8 @@ fn connect_couch_prompt(devices: &[Value]) -> &'static str {
             .as_u64()
             .is_some_and(|pid| DOWNLOAD_MODE_PIDS.contains(&pid))
     }) {
-        "Your remote is still in download mode from an earlier attempt. Hold the side Power \
-         button until it turns off, then start it again."
+        "A remote connected to this computer is still in download mode from an earlier attempt. \
+         If it is yours, hold its side Power button until it turns off, then start it again."
     } else {
         "Keep Couch powered on and connected through USB so its physical port can be selected."
     }
@@ -406,32 +406,75 @@ fn confirm_without_enrollment(ui: &mut Ui, skip_userdata: bool) -> Result<bool> 
         ],
     )? == 0)
 }
-/// Why a reinstall without a saved enrollment refused the remote's images.
-/// Every refusal comes after the read-only capture, with the remote still in
-/// download mode, so each says how to get it out.
-fn couch_images_refusal(refused: &crate::android_images::CouchImages) -> &'static str {
-    use crate::android_images::CouchImages;
-    match refused {
-        CouchImages::AndroidBoot => {
+/// A reinstall without a saved enrollment, after the read-only capture:
+/// the evidence to journal, or the journal reason and message to refuse
+/// with. Every refusal comes with the remote still in download mode, so each
+/// says how to get it out.
+fn couch_images_admission(
+    images: &std::result::Result<
+        crate::android_images::CouchImages,
+        crate::android_images::Refusal,
+    >,
+    skip_userdata: bool,
+) -> std::result::Result<&'static str, (&'static str, &'static str)> {
+    use crate::android_images::Refusal;
+    match images {
+        // An Android remote whose install stopped after the recovery write
+        // looks exactly like this and still holds Android's userdata. Only a
+        // reinstall that backs userdata up first may continue.
+        Ok(images) if images.stage_in_boot && skip_userdata => Err((
+            "stage_without_data_backup",
+            "Your remote's last installation stopped halfway. Nothing was written. Hold the \
+             side Power button until the remote turns off, then run the installer again and \
+             choose Back up current Couch data",
+        )),
+        Ok(images) => Ok(images.evidence),
+        Err(refused @ Refusal::AndroidBoot) => Err((
+            refused.reason(),
             "This remote is running Android, not Couch, so it cannot be reinstalled without a \
              saved enrollment. Nothing was written. Hold the side Power button until the remote \
              turns off, start Android again, then run the installer and choose Install with \
-             Android backup: that keeps the Android enrollment this option cannot"
-        }
-        CouchImages::AndroidRecovery => {
+             Android backup: that keeps the Android enrollment this option cannot",
+        )),
+        Err(refused @ Refusal::AndroidRecovery) => Err((
+            refused.reason(),
             "This remote still has Android's recovery, so it was last running Android, not \
              Couch, and it cannot be reinstalled without a saved enrollment. Nothing was \
              written. Hold the side Power button until the remote turns off, then start it \
              again. If it starts Android, run the installer and choose Install with Android \
              backup. If it does not, an earlier installation attempt stopped after writing its \
              installer to the remote; keep that attempt's folder, which holds the original boot \
-             image, and ask for help"
-        }
-        CouchImages::Couch(_) | CouchImages::Unrecognised(_) => {
+             image, and ask for help",
+        )),
+        Err(refused @ Refusal::Unrecognised(_)) => Err((
+            refused.reason(),
             "The remote's current boot or recovery image is neither Couch nor Android, so it \
              cannot be reinstalled without a saved enrollment. Nothing was written. Hold the \
              side Power button until the remote turns off and ask for help, including the \
-             folder named below"
+             folder named below",
+        )),
+    }
+}
+/// Which CID the download agent must report, and what the binding then rests
+/// on. `expected` is the enrolled CID, or the one the running Couch reported
+/// over USB before its restart.
+fn download_agent_cid(expected: Option<&str>, observed: &str, fresh: bool) -> Result<&'static str> {
+    match expected {
+        Some(expected) => {
+            ensure!(
+                observed == expected,
+                "{}",
+                if fresh {
+                    OTHER_DOWNLOAD_REMOTE
+                } else {
+                    "Canonical download-agent CID differs from enrollment"
+                }
+            );
+            Ok("serial_and_download_agent")
+        }
+        None => {
+            ensure!(fresh, "missing enrolled CID");
+            Ok("download_agent")
         }
     }
 }
@@ -944,24 +987,7 @@ fn install(
     // Without a saved enrollment the CID read over the serial shell before the
     // restart binds the remote; where that was unavailable, this download-mode
     // read on the same physical port is the first observation.
-    let cid_source = match binding.expected() {
-        Some(expected) => {
-            ensure!(
-                cid == expected,
-                "{}",
-                if fresh {
-                    OTHER_DOWNLOAD_REMOTE
-                } else {
-                    "Canonical download-agent CID differs from enrollment"
-                }
-            );
-            "serial_and_download_agent"
-        }
-        None => {
-            ensure!(fresh, "missing enrolled CID");
-            "download_agent"
-        }
-    };
+    let cid_source = download_agent_cid(binding.expected(), cid, fresh)?;
     let device = &connected["device"];
     enrollment::admit_layout(device, cid, &prepared)?;
     let mut required = 256 * 1024 * 1024u64;
@@ -1014,17 +1040,18 @@ fn install(
         // Nothing has been written. The remote must positively be running
         // Couch: Couch's boot and recovery and a MediaTek overlay, exactly as
         // just captured. Android here would lose its data with no backup.
-        match enrollment::couch_originals(session.path(), &originals)? {
-            crate::android_images::CouchImages::Couch(evidence) => {
+        let images = enrollment::couch_originals(session.path(), &originals)?;
+        match couch_images_admission(&images, skip_userdata) {
+            Ok(evidence) => {
                 session.checkpoint(&json!({"event":"couch_boot_verified","evidence":evidence,"boot_sha256":originals["boot"]}))?;
             }
-            refused => {
-                let mut evidence = json!({"event":"couch_boot_refused","reason":refused.reason()});
-                if let crate::android_images::CouchImages::Unrecognised(detail) = &refused {
+            Err((reason, message)) => {
+                let mut evidence = json!({"event":"couch_boot_refused","reason":reason});
+                if let Err(crate::android_images::Refusal::Unrecognised(detail)) = &images {
                     evidence["detail"] = json!(detail);
                 }
                 session.checkpoint(&evidence)?;
-                anyhow::bail!("{}", couch_images_refusal(&refused));
+                anyhow::bail!("{message}");
             }
         }
         session.transition(Phase::AndroidBound,&json!({"event":"couch_device_bound","original_os":"Couch","android_enrollment":"none","cid":cid,"cid_source":cid_source,"usb":bound,"restore_available":false}))?;
@@ -1496,31 +1523,100 @@ mod tests {
             stuck["pid"] = json!(pid);
             let prompt = connect_couch_prompt(&[other.clone(), stuck]);
             assert!(prompt.contains("still in download mode"), "{pid:#x}");
-            assert!(prompt.contains("Hold the side Power button until it turns off"));
+            assert!(prompt.starts_with("A remote connected to this computer"));
+            assert!(prompt.contains("hold its side Power button until it turns off"));
         }
     }
 
     #[test]
     fn every_refusal_after_download_mode_says_how_to_turn_the_remote_off() {
-        use crate::android_images::CouchImages;
-        for message in [
-            couch_images_refusal(&CouchImages::AndroidBoot),
-            couch_images_refusal(&CouchImages::AndroidRecovery),
-            couch_images_refusal(&CouchImages::Unrecognised("boot: zeros".into())),
-            OTHER_DOWNLOAD_REMOTE,
-        ] {
+        use crate::android_images::{CouchImages, Refusal};
+        let couch = |stage_in_boot| {
+            Ok(CouchImages {
+                evidence: if stage_in_boot { "stage" } else { "couch" },
+                stage_in_boot,
+            })
+        };
+        assert_eq!(couch_images_admission(&couch(false), true), Ok("couch"));
+        assert_eq!(couch_images_admission(&couch(false), false), Ok("couch"));
+        // A half-finished install is admitted only with a data backup.
+        assert_eq!(couch_images_admission(&couch(true), false), Ok("stage"));
+        let (reason, halfway) = couch_images_admission(&couch(true), true).unwrap_err();
+        assert_eq!(reason, "stage_without_data_backup");
+        assert!(halfway.starts_with("Your remote's last installation stopped halfway"));
+        assert!(halfway.ends_with("choose Back up current Couch data"));
+        let refused = |refusal| couch_images_admission(&Err(refusal), false).unwrap_err();
+        let (reason, android) = refused(Refusal::AndroidBoot);
+        assert_eq!(reason, "android_boot");
+        assert!(android.starts_with("This remote is running Android"));
+        let (reason, recovery) = refused(Refusal::AndroidRecovery);
+        assert_eq!(reason, "android_recovery");
+        assert!(recovery.contains("Android's recovery"));
+        let (reason, neither) = refused(Refusal::Unrecognised("boot: zeros".into()));
+        assert_eq!(reason, "unrecognised");
+        assert!(neither.contains("neither Couch nor Android"));
+        for message in [halfway, android, recovery, neither, OTHER_DOWNLOAD_REMOTE] {
             assert!(message.contains("Nothing was written"), "{message}");
             assert!(
                 message.contains("Hold the side Power button until the remote turns off"),
                 "{message}"
             );
+            // run() appends ". Keep saved originals…".
+            assert!(!message.ends_with('.'), "{message}");
         }
-        assert!(couch_images_refusal(&CouchImages::AndroidBoot)
-            .starts_with("This remote is running Android"));
-        assert!(couch_images_refusal(&CouchImages::AndroidRecovery).contains("Android's recovery"));
-        assert!(
-            couch_images_refusal(&CouchImages::Unrecognised(String::new()))
-                .contains("neither Couch nor Android")
+    }
+
+    #[test]
+    fn the_download_agent_must_report_the_cid_the_remote_was_bound_by() {
+        let cid = "12".repeat(16);
+        let other = "34".repeat(16);
+        assert_eq!(
+            download_agent_cid(Some(&cid), &cid, true).unwrap(),
+            "serial_and_download_agent"
         );
+        assert_eq!(
+            download_agent_cid(None, &cid, true).unwrap(),
+            "download_agent"
+        );
+        assert_eq!(
+            download_agent_cid(Some(&cid), &other, true)
+                .unwrap_err()
+                .to_string(),
+            OTHER_DOWNLOAD_REMOTE
+        );
+        assert_eq!(
+            download_agent_cid(Some(&cid), &other, false)
+                .unwrap_err()
+                .to_string(),
+            "Canonical download-agent CID differs from enrollment"
+        );
+        assert!(download_agent_cid(Some(&cid), &cid, false).is_ok());
+        assert_eq!(
+            download_agent_cid(None, &cid, false)
+                .unwrap_err()
+                .to_string(),
+            "missing enrolled CID"
+        );
+    }
+
+    #[test]
+    fn nothing_is_written_before_the_remote_is_bound() {
+        // A reinstall without a saved enrollment reaches OriginalsSaved, and
+        // with it the boot write, only through the couch_device_bound
+        // transition: the session refuses any shortcut from InputsVerified.
+        let (_root, mut session) = crate::couch_restart::tests::private_session();
+        for phase in [
+            Phase::OriginalsSaved,
+            Phase::StageBootPending,
+            Phase::Writing,
+        ] {
+            assert!(session.transition(phase, &json!({})).is_err());
+        }
+        session
+            .transition(Phase::AndroidBound, &json!({"event":"couch_device_bound"}))
+            .unwrap();
+        session
+            .transition(Phase::OriginalsSaved, &json!({}))
+            .unwrap();
     }
 }

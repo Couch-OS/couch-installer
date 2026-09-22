@@ -169,7 +169,9 @@ boot and recovery must both be structurally Couch (a gzip cpio ramdisk with
 exactly one root `init` starting `#!/bin/busybox sh`, a root `bin/busybox` and no
 `init.rc`) and the overlay a MediaTek dtbo. A stock Android boot or recovery
 refuses, which also refuses an Android remote whose boot still holds a
-half-written installer stage. The session records `original_os: Couch` and
+half-written installer stage. The installer's own RAM stage in boot beside Couch's
+recovery (an earlier installation stopped halfway, possibly over Android's data)
+is admitted only when current data is backed up first. The session records `original_os: Couch` and
 `android_enrollment: none` in `current-couch-snapshot.json`; it is never offered
 or imported as an Android enrollment, and the bootstrap recovery tool admits its
 `couch_device_bound` binding. To check that decision offline against saved

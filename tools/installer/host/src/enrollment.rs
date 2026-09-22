@@ -252,7 +252,8 @@ fn read_original(directory: &Path, name: &str) -> Result<Vec<u8>> {
 pub fn couch_originals(
     directory: &Path,
     captured: &BTreeMap<String, String>,
-) -> Result<crate::android_images::CouchImages> {
+) -> Result<std::result::Result<crate::android_images::CouchImages, crate::android_images::Refusal>>
+{
     let mut images = BTreeMap::new();
     for name in ["boot", "recovery", "odmdtbo"] {
         let bytes = read_original(directory, name)?;
@@ -342,7 +343,7 @@ mod tests {
     }
     #[test]
     fn couch_originals_refuse_android_boot_and_foreign_overlay() {
-        use crate::android_images::{fixtures, CouchImages};
+        use crate::android_images::{fixtures, Refusal};
         let root = tempfile::tempdir().unwrap();
         let write = |boot: &[u8], recovery: &[u8], overlay: &[u8]| {
             let mut captured = BTreeMap::new();
@@ -358,9 +359,18 @@ mod tests {
             &fixtures::couch_recovery(),
             &overlay,
         );
+        let admitted = couch_originals(root.path(), &captured).unwrap().unwrap();
         assert_eq!(
-            couch_originals(root.path(), &captured).unwrap(),
-            CouchImages::Couch("couch-boot-image+couch-recovery-image+mediatek-overlay")
+            admitted.evidence,
+            "couch-boot-image+couch-recovery-image+mediatek-overlay"
+        );
+        assert!(!admitted.stage_in_boot);
+        let captured = write(&fixtures::stage(), &fixtures::couch_recovery(), &overlay);
+        assert!(
+            couch_originals(root.path(), &captured)
+                .unwrap()
+                .unwrap()
+                .stage_in_boot
         );
         let captured = write(
             &fixtures::android_boot(),
@@ -369,12 +379,12 @@ mod tests {
         );
         assert_eq!(
             couch_originals(root.path(), &captured).unwrap(),
-            CouchImages::AndroidBoot
+            Err(Refusal::AndroidBoot)
         );
         let captured = write(&fixtures::stage(), &fixtures::android_recovery(), &overlay);
         assert_eq!(
             couch_originals(root.path(), &captured).unwrap(),
-            CouchImages::AndroidRecovery
+            Err(Refusal::AndroidRecovery)
         );
         let captured = write(
             &fixtures::couch_boot(),
@@ -383,7 +393,7 @@ mod tests {
         );
         assert!(matches!(
             couch_originals(root.path(), &captured).unwrap(),
-            CouchImages::Unrecognised(_)
+            Err(Refusal::Unrecognised(_))
         ));
         // The file is classified only while it is still what was captured.
         let mut captured = write(

@@ -7,7 +7,7 @@
 //! capture. It opens no USB device, only reads the images, writes nothing,
 //! and prints classes, never image bytes.
 use anyhow::{ensure, Context, Result};
-use couch_installer_host::android_images::{self, CouchImages, PARTITION_SIZE};
+use couch_installer_host::android_images::{self, PARTITION_SIZE};
 use std::{fs, io::Read, path::Path};
 
 fn image(folder: &Path, name: &str) -> Result<Option<Vec<u8>>> {
@@ -47,8 +47,11 @@ fn main() -> Result<()> {
         let decision = match image(&folder, "odmdtbo")? {
             None => "no saved overlay".to_string(),
             Some(overlay) => match android_images::couch_images(&boot, &recovery, &overlay) {
-                CouchImages::Couch(evidence) => format!("admit ({evidence})"),
-                refused => format!("refuse ({})", refused.reason()),
+                Ok(images) if images.stage_in_boot => {
+                    format!("admit only with a data backup ({})", images.evidence)
+                }
+                Ok(images) => format!("admit ({})", images.evidence),
+                Err(refused) => format!("refuse ({})", refused.reason()),
             },
         };
         println!(

@@ -751,6 +751,85 @@ mod tests {
         assert!(import_checked(&other, &mut accepted).is_ok());
     }
     #[test]
+    fn a_reinstall_without_enrollment_is_never_importable_as_android() {
+        let root = private_root();
+        let source = root.path().join("fresh");
+        let mut fresh = SessionGuard::create(&source).unwrap();
+        fresh
+            .transition(Phase::InputsVerified, &json!({"event":"inputs_verified"}))
+            .unwrap();
+        fresh
+            .checkpoint(&json!({"event":"reinstall_without_android_enrollment","android_enrollment":"none"}))
+            .unwrap();
+        // The record exactly as that session writes it, from live captures.
+        let mut record = record();
+        record.original_os = "Couch".into();
+        record.android_identity = None;
+        for (name, entry) in &mut record.originals {
+            let data = match name.as_str() {
+                "boot" => crate::android_images::fixtures::couch_boot(),
+                "odmdtbo" => crate::android_images::fixtures::mediatek_overlay(),
+                _ => vec![7; entry.size as usize],
+            };
+            entry.sha256 = digest(&data);
+            fs::write(source.join(&entry.file), data).unwrap();
+            if IDENTITY.contains(&name.as_str()) {
+                record
+                    .identity_sha256
+                    .insert(name.clone(), entry.sha256.clone());
+            }
+            // Captured before any binding, as every reinstall does.
+            fresh.checkpoint(&json!({"event":"bootstrap_original_verified","target":name,"size":entry.size,"sha256":entry.sha256,"file":entry.file})).unwrap();
+        }
+        let mut snapshot = serde_json::to_value(&record).unwrap();
+        snapshot["android_enrollment"] = json!("none");
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        fresh
+            .transition(Phase::AndroidBound, &json!({"event":"couch_device_bound","original_os":"Couch","android_enrollment":"none","cid":record.cid}))
+            .unwrap();
+        fresh
+            .transition(
+                Phase::OriginalsSaved,
+                &json!({"event":"enrollment_complete","enrollment_sha256":digest(&bytes)}),
+            )
+            .unwrap();
+        drop(fresh);
+        // Worst case: the snapshot renamed to the file import looks for.
+        fs::write(source.join("enrollment.json"), &bytes).unwrap();
+        let mut target = SessionGuard::create(&root.path().join("target")).unwrap();
+        assert!(import_checked(&source, &mut target).is_err());
+        assert!(!target.path().join("imported-enrollment").exists());
+        // Each of these refuses it on its own.
+        let error = serde_json::from_slice::<Record>(&bytes).err().unwrap();
+        assert!(error.to_string().contains("android_enrollment"), "{error}");
+        let error = validate(&record).unwrap_err();
+        assert!(
+            error.to_string().contains("not an original Android"),
+            "{error}"
+        );
+        let mut android = record.clone();
+        android.original_os = "Android".into();
+        android.android_identity = self::record().android_identity;
+        let error = journal(&source, &android, &digest(&bytes)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("original verification checkpoint"),
+            "{error:#}"
+        );
+        let error = crate::android_images::android_originals(
+            &crate::android_images::fixtures::couch_boot(),
+            &crate::android_images::fixtures::mediatek_overlay(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no init.rc"), "{error}");
+        // And discovery never offers the folder in the first place.
+        fs::write(source.join("current-couch-snapshot.json"), &bytes).unwrap();
+        assert!(
+            crate::enrollment_sources::discover(root.path(), Some(source.clone()))
+                .iter()
+                .all(|candidate| candidate.path != source)
+        );
+    }
+    #[test]
     fn legacy_import_preserves_evidence_and_requires_independent_pin_and_live_overlay() {
         let root = private_root();
         let source = root.path().join("python-run");

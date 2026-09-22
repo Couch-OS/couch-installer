@@ -1,4 +1,4 @@
-//! Structural admission of a remote's original Android boot and overlay images.
+//! Structural admission of a remote's boot, recovery and overlay images.
 //!
 //! The installer writes its own boot, recovery, logo, overlay and userdata, so
 //! the Android version on the remote does not affect Couch. The saved boot and
@@ -14,11 +14,18 @@
 //! - `odmdtbo` is a MediaTek dtbo container whose flattened device tree names
 //!   `mediatek,` compatibles.
 //!
+//! A reinstall without a saved enrollment needs the opposite, positive answer
+//! before it writes anything: that the remote runs Couch. [`couch_boot`]
+//! accepts only Couch's own ramdisk shape, and [`couch_images`] requires it of
+//! both boot and recovery, so an Android remote whose boot still holds a
+//! half-written installer stage (same busybox shape as Couch) is refused by
+//! its Android recovery.
+//!
 //! HA100 identity itself is established elsewhere: the exact partition layout,
 //! the eMMC CID, the MT6580 hardware code and the ADB model.
 use anyhow::{ensure, Context, Result};
 use flate2::read::GzDecoder;
-use std::io::Read;
+use std::{io::Read, ops::Range};
 
 pub const PARTITION_SIZE: usize = 16 * 1024 * 1024;
 const BOOT_MAGIC: &[u8; 8] = b"ANDROID!";
@@ -26,6 +33,10 @@ const MTK_DTBO_MAGIC: u32 = 0x8816_8858;
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_OFFSET: usize = 0x400;
 const RAMDISK_LIMIT: u64 = 64 * 1024 * 1024;
+/// How every Couch boot, recovery and installer-stage `init` starts.
+const COUCH_INIT: &[u8] = b"#!/bin/busybox sh";
+const REGULAR_FILE: u32 = 0o100000;
+const FILE_TYPE: u32 = 0o170000;
 
 fn le32(bytes: &[u8], offset: usize) -> Result<usize> {
     let raw = bytes
@@ -46,10 +57,22 @@ fn aligned(value: usize, page: usize) -> Result<usize> {
         .context("image offset overflow")
 }
 
-/// Names of the entries of a newc cpio archive. Lenient on purpose: it only
-/// walks headers and never trusts metadata beyond the bounds it needs.
-fn cpio_names(archive: &[u8]) -> Result<Vec<String>> {
-    let mut names = Vec::new();
+/// One entry of a newc cpio archive: its name, mode and where its data lies.
+struct CpioEntry {
+    name: String,
+    mode: u32,
+    data: Range<usize>,
+}
+impl CpioEntry {
+    fn regular(&self) -> bool {
+        self.mode & FILE_TYPE == REGULAR_FILE
+    }
+}
+
+/// The entries of a newc cpio archive. Lenient on purpose: it only walks
+/// headers and never trusts metadata beyond the bounds it needs.
+fn cpio_entries(archive: &[u8]) -> Result<Vec<CpioEntry>> {
+    let mut entries = Vec::new();
     let mut offset = 0;
     while let Some(header) = archive.get(offset..offset + 110) {
         ensure!(
@@ -60,7 +83,7 @@ fn cpio_names(archive: &[u8]) -> Result<Vec<String>> {
             let text = std::str::from_utf8(&header[6 + index * 8..14 + index * 8])?;
             Ok(usize::from_str_radix(text, 16)?)
         };
-        let (size, name_size) = (field(6)?, field(11)?);
+        let (mode, size, name_size) = (field(1)?, field(6)?, field(11)?);
         ensure!(name_size > 0 && name_size <= 4096, "invalid cpio name size");
         let name_end = offset + 110 + name_size;
         let name = archive
@@ -68,34 +91,40 @@ fn cpio_names(archive: &[u8]) -> Result<Vec<String>> {
             .context("truncated cpio name")?;
         let name = std::str::from_utf8(&name[..name.len() - 1])?.to_owned();
         let data_start = aligned(name_end, 4)?;
-        offset = aligned(data_start.checked_add(size).context("cpio overflow")?, 4)?;
+        let data_end = data_start.checked_add(size).context("cpio overflow")?;
+        offset = aligned(data_end, 4)?;
         ensure!(offset <= archive.len(), "truncated cpio file");
         if name == "TRAILER!!!" {
-            return Ok(names);
+            return Ok(entries);
         }
-        names.push(name);
-        ensure!(names.len() <= 65536, "cpio archive exceeds bound");
+        entries.push(CpioEntry {
+            name,
+            mode: mode as u32,
+            data: data_start..data_end,
+        });
+        ensure!(entries.len() <= 65536, "cpio archive exceeds bound");
     }
     anyhow::bail!("cpio archive has no trailer")
 }
 
-/// An Android boot image (header version 0, as MT6580 firmware uses) whose
-/// gzip cpio ramdisk carries Android's `init.rc` at the archive root.
-pub fn android_boot(image: &[u8]) -> Result<()> {
+/// The decompressed ramdisk of one full boot-partition image in the Android
+/// boot image format (header version 0, as MT6580 firmware uses). `what`
+/// names the image in errors.
+fn ramdisk(image: &[u8], what: &str) -> Result<Vec<u8>> {
     ensure!(
         image.len() == PARTITION_SIZE,
-        "boot original is not a complete partition"
+        "{what} is not a complete partition"
     );
     ensure!(
         &image[..8] == BOOT_MAGIC,
-        "boot original is not an Android boot image"
+        "{what} is not an Android boot image"
     );
     let kernel_size = le32(image, 8)?;
     let ramdisk_size = le32(image, 16)?;
     let page = le32(image, 36)?;
     ensure!(
         [2048, 4096, 8192, 16384].contains(&page) && kernel_size > 0 && ramdisk_size > 0,
-        "boot original has an unsupported header geometry"
+        "{what} has an unsupported header geometry"
     );
     let ramdisk_start = aligned(page + kernel_size, page)?;
     let ramdisk = image
@@ -105,22 +134,136 @@ pub fn android_boot(image: &[u8]) -> Result<()> {
                     .checked_add(ramdisk_size)
                     .context("boot overflow")?,
         )
-        .context("boot original ramdisk exceeds the partition")?;
+        .with_context(|| format!("{what} ramdisk exceeds the partition"))?;
     let mut archive = Vec::new();
     GzDecoder::new(ramdisk)
         .take(RAMDISK_LIMIT + 1)
         .read_to_end(&mut archive)
-        .context("boot original ramdisk is not gzip")?;
+        .with_context(|| format!("{what} ramdisk is not gzip"))?;
     ensure!(
         archive.len() as u64 <= RAMDISK_LIMIT,
-        "boot original ramdisk exceeds bound"
+        "{what} ramdisk exceeds bound"
     );
-    let names = cpio_names(&archive)?;
+    Ok(archive)
+}
+
+/// An Android boot image (header version 0, as MT6580 firmware uses) whose
+/// gzip cpio ramdisk carries Android's `init.rc` at the archive root.
+pub fn android_boot(image: &[u8]) -> Result<()> {
+    let archive = ramdisk(image, "boot original")?;
+    let entries = cpio_entries(&archive)?;
     ensure!(
-        names.iter().any(|name| name == "init.rc"),
+        entries.iter().any(|entry| entry.name == "init.rc"),
         "boot original ramdisk is not Android (no init.rc); a Couch image is not an Android original"
     );
     Ok(())
+}
+
+/// A Couch boot, recovery or installer-stage image: the vendor header over a
+/// busybox ramdisk whose root holds exactly one `init`, a regular file
+/// starting `#!/bin/busybox sh`, and exactly one regular `bin/busybox`, and
+/// no Android `init.rc`. Stock Android boot and recovery images carry a root
+/// `init.rc` and an ELF `init`, so neither shape can pass for the other.
+pub fn couch_boot(image: &[u8]) -> Result<()> {
+    let archive = ramdisk(image, "image")?;
+    let entries = cpio_entries(&archive)?;
+    let named = |name: &str| {
+        entries
+            .iter()
+            .filter(|entry| entry.name == name)
+            .collect::<Vec<_>>()
+    };
+    ensure!(
+        named("init.rc").is_empty(),
+        "image is Android (its ramdisk has init.rc)"
+    );
+    let init = named("init");
+    ensure!(
+        init.len() == 1
+            && init[0].regular()
+            && archive[init[0].data.clone()].starts_with(COUCH_INIT),
+        "image ramdisk has no Couch init (a root #!/bin/busybox sh script)"
+    );
+    let busybox = named("bin/busybox");
+    ensure!(
+        busybox.len() == 1 && busybox[0].regular(),
+        "image ramdisk has no bin/busybox"
+    );
+    Ok(())
+}
+
+/// What one boot-format image is, as far as a reinstall is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootKind {
+    /// Stock Android: a root `init.rc`.
+    Android,
+    /// Couch's boot, recovery or installer stage.
+    Couch,
+    /// Neither: empty, truncated, foreign or damaged.
+    Unrecognised,
+}
+impl BootKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            BootKind::Android => "android",
+            BootKind::Couch => "couch",
+            BootKind::Unrecognised => "unrecognised",
+        }
+    }
+}
+pub fn boot_kind(image: &[u8]) -> BootKind {
+    if android_boot(image).is_ok() {
+        BootKind::Android
+    } else if couch_boot(image).is_ok() {
+        BootKind::Couch
+    } else {
+        BootKind::Unrecognised
+    }
+}
+
+/// What a reinstall without a saved enrollment makes of the remote's current
+/// boot, recovery and overlay, before anything is written.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CouchImages {
+    /// Boot and recovery are Couch's and the overlay is MediaTek's. Carries
+    /// the evidence string recorded in the journal.
+    Couch(&'static str),
+    /// Boot is stock Android: the remote runs Android.
+    AndroidBoot,
+    /// Recovery is stock Android: the remote was last running Android, even
+    /// if its boot now holds a half-written installer stage.
+    AndroidRecovery,
+    /// Neither Couch nor Android, or a foreign overlay; names the failed check.
+    Unrecognised(String),
+}
+impl CouchImages {
+    /// Journal reason for a refusal.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            CouchImages::Couch(_) => "couch",
+            CouchImages::AndroidBoot => "android_boot",
+            CouchImages::AndroidRecovery => "android_recovery",
+            CouchImages::Unrecognised(_) => "unrecognised",
+        }
+    }
+}
+pub fn couch_images(boot: &[u8], recovery: &[u8], overlay: &[u8]) -> CouchImages {
+    if android_boot(boot).is_ok() {
+        return CouchImages::AndroidBoot;
+    }
+    if android_boot(recovery).is_ok() {
+        return CouchImages::AndroidRecovery;
+    }
+    for (name, check) in [
+        ("boot", couch_boot(boot)),
+        ("recovery", couch_boot(recovery)),
+        ("odmdtbo", mediatek_overlay(overlay)),
+    ] {
+        if let Err(error) = check {
+            return CouchImages::Unrecognised(format!("{name}: {error:#}"));
+        }
+    }
+    CouchImages::Couch("couch-boot-image+couch-recovery-image+mediatek-overlay")
 }
 
 /// A MediaTek dtbo container with a flattened device tree at 0x400 that names
@@ -162,12 +305,12 @@ pub(crate) mod fixtures {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
 
-    fn cpio(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    fn cpio(entries: &[(&str, u32, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut push = |name: &str, data: &[u8]| {
+        let mut push = |name: &str, mode: u32, data: &[u8]| {
             let header = format!(
                 "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
-                out.len() + 1, 0o100644, 0, 0, 1, 0, data.len(), 0, 0, 0, 0, name.len() + 1, 0
+                out.len() + 1, mode, 0, 0, 1, 0, data.len(), 0, 0, 0, 0, name.len() + 1, 0
             );
             out.extend_from_slice(header.as_bytes());
             out.extend_from_slice(name.as_bytes());
@@ -180,13 +323,20 @@ pub(crate) mod fixtures {
                 out.push(0);
             }
         };
-        for (name, data) in entries {
-            push(name, data);
+        for (name, mode, data) in entries {
+            push(name, *mode, data);
         }
-        push("TRAILER!!!", b"");
+        push("TRAILER!!!", 0, b"");
         out
     }
     pub(crate) fn boot_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let regular: Vec<_> = entries
+            .iter()
+            .map(|(name, data)| (*name, 0o100644, *data))
+            .collect();
+        boot_with_modes(&regular)
+    }
+    pub(crate) fn boot_with_modes(entries: &[(&str, u32, &[u8])]) -> Vec<u8> {
         let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
         gzip.write_all(&cpio(entries)).unwrap();
         let ramdisk = gzip.finish().unwrap();
@@ -208,11 +358,36 @@ pub(crate) mod fixtures {
             ("default.prop", b"ro.debuggable=1\n"),
         ])
     }
+    /// A stock recovery: the same shape as the stock boot, with an ELF init.
+    pub(crate) fn android_recovery() -> Vec<u8> {
+        boot_with(&[
+            ("init", b"\x7fELF\x01\x01\x01"),
+            ("init.rc", b"on init\n"),
+            ("init.recovery.mt6580.rc", b"on init\n"),
+        ])
+    }
     /// A Couch-style image: same header, busybox ramdisk, no init.rc.
     pub(crate) fn couch_boot() -> Vec<u8> {
         boot_with(&[
             ("bin/busybox", b"\x7fELF"),
             ("init", b"#!/bin/busybox sh\n"),
+        ])
+    }
+    /// Couch recovery: its own busybox init script beside the same busybox.
+    pub(crate) fn couch_recovery() -> Vec<u8> {
+        boot_with(&[
+            ("bin", b""),
+            ("bin/busybox", b"\x7fELF"),
+            ("extra/fbcon", b"\x7fELF"),
+            ("init", b"#!/bin/busybox sh\n# Couch recovery\n"),
+        ])
+    }
+    /// The installer's RAM stage, which an interrupted run leaves in boot.
+    pub(crate) fn stage() -> Vec<u8> {
+        boot_with(&[
+            ("init", b"#!/bin/busybox sh\n# Private benchmark only.\n"),
+            ("bin/busybox", b"\x7fELF"),
+            ("bin/couch-installer-probe", b"\x7fELF"),
         ])
     }
     pub(crate) fn overlay_with(compatible: &[u8]) -> Vec<u8> {
@@ -294,5 +469,131 @@ mod tests {
         );
         assert!(android_originals(&fixtures::couch_boot(), &fixtures::mediatek_overlay()).is_err());
         assert!(android_originals(&fixtures::android_boot(), &fixtures::couch_boot()).is_err());
+    }
+
+    #[test]
+    fn couch_boot_admits_couch_and_stage_ramdisks_but_never_android() {
+        for couch in [
+            fixtures::couch_boot(),
+            fixtures::couch_recovery(),
+            fixtures::stage(),
+        ] {
+            couch_boot(&couch).unwrap();
+            assert_eq!(boot_kind(&couch), BootKind::Couch);
+        }
+        for android in [fixtures::android_boot(), fixtures::android_recovery()] {
+            let error = couch_boot(&android).unwrap_err().to_string();
+            assert!(error.contains("init.rc"), "{error}");
+            assert_eq!(boot_kind(&android), BootKind::Android);
+        }
+        // A busybox init beside Android's init.rc is still Android.
+        let mixed = fixtures::boot_with(&[
+            ("init", b"#!/bin/busybox sh\n"),
+            ("bin/busybox", b"\x7fELF"),
+            ("init.rc", b"on init\n"),
+        ]);
+        assert!(couch_boot(&mixed).is_err());
+        assert_eq!(boot_kind(&mixed), BootKind::Android);
+        let mut truncated = fixtures::couch_boot();
+        truncated.truncate(PARTITION_SIZE - 512);
+        for (label, image) in [
+            ("zeros", vec![0; PARTITION_SIZE]),
+            ("truncated", truncated),
+            (
+                "elf init without init.rc",
+                fixtures::boot_with(&[("init", b"\x7fELF"), ("bin/busybox", b"\x7fELF")]),
+            ),
+            (
+                "another shell",
+                fixtures::boot_with(&[("init", b"#!/bin/sh\n"), ("bin/busybox", b"\x7fELF")]),
+            ),
+            (
+                "no busybox",
+                fixtures::boot_with(&[("init", b"#!/bin/busybox sh\n")]),
+            ),
+            (
+                "nested init",
+                fixtures::boot_with(&[
+                    ("sbin/init", b"#!/bin/busybox sh\n"),
+                    ("bin/busybox", b"\x7fELF"),
+                ]),
+            ),
+            (
+                "two inits",
+                fixtures::boot_with(&[
+                    ("init", b"#!/bin/busybox sh\n"),
+                    ("init", b"\x7fELF"),
+                    ("bin/busybox", b"\x7fELF"),
+                ]),
+            ),
+            (
+                "symlinked init",
+                fixtures::boot_with_modes(&[
+                    ("init", 0o120777, b"#!/bin/busybox sh"),
+                    ("bin/busybox", 0o100755, b"\x7fELF"),
+                ]),
+            ),
+        ] {
+            assert!(couch_boot(&image).is_err(), "{label} was admitted as Couch");
+            assert_eq!(boot_kind(&image), BootKind::Unrecognised, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_reinstall_needs_couch_boot_and_couch_recovery_and_a_mediatek_overlay() {
+        let overlay = fixtures::mediatek_overlay();
+        let couch = |boot: &[u8], recovery: &[u8]| couch_images(boot, recovery, &overlay);
+        assert_eq!(
+            couch(&fixtures::couch_boot(), &fixtures::couch_recovery()),
+            CouchImages::Couch("couch-boot-image+couch-recovery-image+mediatek-overlay")
+        );
+        // A Couch remote stuck mid-install still has Couch recovery: repairable.
+        assert!(matches!(
+            couch(&fixtures::stage(), &fixtures::couch_recovery()),
+            CouchImages::Couch(_)
+        ));
+        // The same stage beside Android's recovery is an Android remote whose
+        // install stopped after the boot write: refused, or Android would lose
+        // its data with no backup.
+        assert_eq!(
+            couch(&fixtures::stage(), &fixtures::android_recovery()),
+            CouchImages::AndroidRecovery
+        );
+        assert_eq!(
+            couch(&fixtures::android_boot(), &fixtures::android_recovery()),
+            CouchImages::AndroidBoot
+        );
+        assert_eq!(
+            couch(&fixtures::android_boot(), &fixtures::couch_recovery()),
+            CouchImages::AndroidBoot
+        );
+        assert_eq!(
+            couch(&fixtures::couch_boot(), &fixtures::android_recovery()),
+            CouchImages::AndroidRecovery
+        );
+        for (boot, recovery, check) in [
+            (vec![0; PARTITION_SIZE], fixtures::couch_recovery(), "boot:"),
+            (fixtures::couch_boot(), vec![0; PARTITION_SIZE], "recovery:"),
+            (
+                fixtures::couch_boot()[..4096].to_vec(),
+                fixtures::couch_recovery(),
+                "boot:",
+            ),
+        ] {
+            match couch(&boot, &recovery) {
+                CouchImages::Unrecognised(detail) => {
+                    assert!(detail.starts_with(check), "{detail}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let foreign = couch_images(
+            &fixtures::couch_boot(),
+            &fixtures::couch_recovery(),
+            &fixtures::overlay_with(b"qcom,sdm845\0"),
+        );
+        assert!(matches!(&foreign, CouchImages::Unrecognised(d) if d.starts_with("odmdtbo:")));
+        assert_eq!(foreign.reason(), "unrecognised");
+        assert_eq!(CouchImages::AndroidRecovery.reason(), "android_recovery");
     }
 }

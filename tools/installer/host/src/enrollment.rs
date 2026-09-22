@@ -224,22 +224,49 @@ pub fn capture(
 /// independently captured originals and calibration. This only establishes
 /// that the originals are Android images and not a previous Couch install.
 pub fn android_originals(directory: &Path) -> Result<&'static str> {
-    let mut images = Vec::new();
-    for name in ["boot", "odmdtbo"] {
-        let original = crate::regular(&directory.join(format!("bootstrap-{name}.img")))?;
-        ensure!(
-            original.metadata()?.is_file()
-                && original.metadata()?.len() == crate::android_images::PARTITION_SIZE as u64,
-            "original stock partition size differs"
-        );
-        let mut bytes = Vec::with_capacity(crate::android_images::PARTITION_SIZE);
-        original
-            .take(crate::android_images::PARTITION_SIZE as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        images.push(bytes);
-    }
-    crate::android_images::android_originals(&images[0], &images[1])
+    let boot = read_original(directory, "boot")?;
+    let overlay = read_original(directory, "odmdtbo")?;
+    crate::android_images::android_originals(&boot, &overlay)
         .context("original boot/overlay pair is not HA100 Android firmware")
+}
+
+/// One saved 16 MiB original, read from this session's own capture file.
+fn read_original(directory: &Path, name: &str) -> Result<Vec<u8>> {
+    let original = crate::regular(&directory.join(format!("bootstrap-{name}.img")))?;
+    ensure!(
+        original.metadata()?.is_file()
+            && original.metadata()?.len() == crate::android_images::PARTITION_SIZE as u64,
+        "original stock partition size differs"
+    );
+    let mut bytes = Vec::with_capacity(crate::android_images::PARTITION_SIZE);
+    original
+        .take(crate::android_images::PARTITION_SIZE as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Classify the boot, recovery and overlay this session just captured, for a
+/// reinstall without a saved enrollment. Each file is hashed again and must
+/// still equal the digest its capture checkpoint recorded, so what is
+/// classified is exactly what was read from the remote.
+pub fn couch_originals(
+    directory: &Path,
+    captured: &BTreeMap<String, String>,
+) -> Result<crate::android_images::CouchImages> {
+    let mut images = BTreeMap::new();
+    for name in ["boot", "recovery", "odmdtbo"] {
+        let bytes = read_original(directory, name)?;
+        ensure!(
+            Some(&format!("{:x}", Sha256::digest(&bytes))) == captured.get(name),
+            "saved original {name} changed after it was captured"
+        );
+        images.insert(name, bytes);
+    }
+    Ok(crate::android_images::couch_images(
+        &images["boot"],
+        &images["recovery"],
+        &images["odmdtbo"],
+    ))
 }
 
 pub fn original_boot(session: &SessionGuard) -> PathBuf {
@@ -312,6 +339,69 @@ mod tests {
             &fixtures::mediatek_overlay(),
         );
         assert!(android_originals(root.path()).is_err());
+    }
+    #[test]
+    fn couch_originals_refuse_android_boot_and_foreign_overlay() {
+        use crate::android_images::{fixtures, CouchImages};
+        let root = tempfile::tempdir().unwrap();
+        let write = |boot: &[u8], recovery: &[u8], overlay: &[u8]| {
+            let mut captured = BTreeMap::new();
+            for (name, bytes) in [("boot", boot), ("recovery", recovery), ("odmdtbo", overlay)] {
+                fs::write(root.path().join(format!("bootstrap-{name}.img")), bytes).unwrap();
+                captured.insert(name.to_string(), format!("{:x}", Sha256::digest(bytes)));
+            }
+            captured
+        };
+        let overlay = fixtures::mediatek_overlay();
+        let captured = write(
+            &fixtures::couch_boot(),
+            &fixtures::couch_recovery(),
+            &overlay,
+        );
+        assert_eq!(
+            couch_originals(root.path(), &captured).unwrap(),
+            CouchImages::Couch("couch-boot-image+couch-recovery-image+mediatek-overlay")
+        );
+        let captured = write(
+            &fixtures::android_boot(),
+            &fixtures::android_recovery(),
+            &overlay,
+        );
+        assert_eq!(
+            couch_originals(root.path(), &captured).unwrap(),
+            CouchImages::AndroidBoot
+        );
+        let captured = write(&fixtures::stage(), &fixtures::android_recovery(), &overlay);
+        assert_eq!(
+            couch_originals(root.path(), &captured).unwrap(),
+            CouchImages::AndroidRecovery
+        );
+        let captured = write(
+            &fixtures::couch_boot(),
+            &fixtures::couch_recovery(),
+            &fixtures::overlay_with(b"qcom,sdm845\0"),
+        );
+        assert!(matches!(
+            couch_originals(root.path(), &captured).unwrap(),
+            CouchImages::Unrecognised(_)
+        ));
+        // The file is classified only while it is still what was captured.
+        let mut captured = write(
+            &fixtures::couch_boot(),
+            &fixtures::couch_recovery(),
+            &overlay,
+        );
+        fs::write(
+            root.path().join("bootstrap-boot.img"),
+            fixtures::android_boot(),
+        )
+        .unwrap();
+        let error = couch_originals(root.path(), &captured).unwrap_err();
+        assert!(format!("{error:#}").contains("changed after"), "{error:#}");
+        captured.remove("recovery");
+        assert!(couch_originals(root.path(), &captured).is_err());
+        fs::write(root.path().join("bootstrap-boot.img"), b"short").unwrap();
+        assert!(couch_originals(root.path(), &captured).is_err());
     }
     #[test]
     fn identity_encoding_and_complete_fixed_regions_are_required_before_bootstrap() {

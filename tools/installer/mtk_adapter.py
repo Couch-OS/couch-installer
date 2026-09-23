@@ -31,10 +31,16 @@ READABLE = IDENTITY_PARTITIONS | {'boot', 'recovery', 'odmdtbo', 'logo'}
 
 
 def couch_candidate(raw):
-    """The selected running-Couch port, checked exactly as couch_reboot always has."""
+    """The selected running-Couch port, checked exactly as couch_reboot always has.
+
+    Bus 0 is a real bus. libusb takes macOS bus numbers from the location ID, so
+    a remote on the first controller enumerates as bus 0, and the same remote can
+    be bus 1 in another session or on another port. The physical port chain, not
+    the bus number, is what pins the selection to one port.
+    """
     require(isinstance(raw, dict) and set(raw) == {'bus', 'address', 'ports', 'vid', 'pid'}
             and raw['vid'] == 0x0e8d and raw['pid'] == 0x201c
-            and type(raw['bus']) is int and raw['bus'] > 0
+            and type(raw['bus']) is int and raw['bus'] >= 0
             and isinstance(raw['ports'], list) and raw['ports']
             and all(type(n) is int and 0 < n <= 255 for n in raw['ports']), 'Invalid Couch port')
     return Candidate(raw['bus'], raw['address'], tuple(raw['ports']), raw['vid'], raw['pid'])
@@ -128,7 +134,9 @@ class Adapter:
         require(set(command) == {'op', 'candidate'}, 'Unexpected startup fields')
         raw = command['candidate']
         require(isinstance(raw, dict) and set(raw) == {'bus', 'address', 'ports', 'vid', 'pid'}, 'Invalid USB selection')
-        require(all(type(raw[n]) is int and raw[n] > 0 for n in ('bus', 'address', 'vid', 'pid'))
+        # Bus 0 is legitimate on macOS; see couch_candidate.
+        require(all(type(raw[n]) is int and raw[n] > 0 for n in ('address', 'vid', 'pid'))
+                and type(raw['bus']) is int and raw['bus'] >= 0
                 and isinstance(raw['ports'], list) and raw['ports']
                 and all(type(n) is int and 0 < n <= 255 for n in raw['ports']), 'Invalid USB topology')
         selected = Candidate(raw['bus'], raw['address'], tuple(raw['ports']), raw['vid'], raw['pid'])
@@ -231,7 +239,8 @@ class Adapter:
                         continue
                     if serial == command['serial']:
                         matches.append(device)
-            require(len(matches) == 1 and matches[0].bus and matches[0].port_numbers,
+            # A bus number of 0 is a real bus, not a missing one; see couch_candidate.
+            require(len(matches) == 1 and matches[0].bus is not None and matches[0].port_numbers,
                     'Cannot bind authorized Android serial to one physical USB port'
                     + (f'; {unreadable} MediaTek USB device(s) had unreadable descriptors: stop other ADB servers '
                        'and tools holding the remote, then retry' if unreadable else ''))

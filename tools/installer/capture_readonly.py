@@ -67,7 +67,7 @@ def wait_preloader(enumerate_devices, bus, ports, timeout, *, clock=time.monoton
 
 def capture(args, *, enumerate_devices=None, session=read_session, allow_identity_refresh=False):
     ports = tuple(int(part) for part in args.ports.split("."))
-    require(args.bus > 0 and ports and all(part > 0 for part in ports), "Invalid USB bus/port path")
+    require(args.bus >= 0 and ports and all(part > 0 for part in ports), "Invalid USB bus/port path")
     require(0 < args.timeout <= 600, "Timeout must be between 1 and 600 seconds")
     destination = args.backup_dir.absolute()
     require(not destination.is_symlink() and not destination.exists(), "Use a new identity backup destination")

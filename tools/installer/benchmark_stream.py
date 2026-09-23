@@ -19,7 +19,7 @@ def validate(args):
         ports = tuple(int(part) for part in args.ports.split("."))
     except ValueError as error:
         raise InstallError("Invalid USB port path") from error
-    require(args.bus > 0 and ports and all(part > 0 for part in ports), "Invalid USB bus/port path")
+    require(args.bus >= 0 and ports and all(part > 0 for part in ports), "Invalid USB bus/port path")
     require(0 < args.timeout <= 600, "Timeout must be between 1 and 600 seconds")
     baseline = baseline_record(args.baseline)
     require(baseline is not None and "cid" in baseline

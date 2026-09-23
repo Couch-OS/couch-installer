@@ -130,6 +130,21 @@ class PrivateTuiTests(unittest.TestCase):
     def adapter(self):
         return tui.PrivateAdapter(self.config, validate=self.validate, launch=self.launch)
 
+    def test_bus_zero_is_a_bus_number_and_a_negative_one_is_not(self):
+        """macOS reports a remote on the first controller as bus 0.
+
+        Refusing it stopped the installer before it could reach the remote.
+        """
+        import json
+        for bus, accepted in ((0, True), (1, True), (-1, False), ('0', False)):
+            with self.subTest(bus=bus):
+                self.config.write_text(json.dumps({**self.values, 'bus': bus}))
+                if accepted:
+                    self.assertEqual(self.adapter().args.bus, bus)
+                else:
+                    with self.assertRaises(Exception):
+                        self.adapter()
+
     def test_private_plan_and_cancel_never_construct_child_or_usb_session(self):
         adapter = self.adapter()
         output = io.StringIO()

@@ -41,7 +41,7 @@ def validate(args):
     require(not destination.exists() and not destination.is_symlink(), 'Use a new finalization destination; resume is disabled')
     require(not destination.resolve().is_relative_to(REPO), 'Keep identity and journals outside Git')
     ports = tuple(int(part) for part in args.ports.split('.'))
-    require(args.bus > 0 and ports and all(part > 0 for part in ports), 'Invalid USB bus/port')
+    require(args.bus >= 0 and ports and all(part > 0 for part in ports), 'Invalid USB bus/port')
     require(0 < args.timeout <= 600, 'Timeout must be between 1 and 600 seconds')
     source_pin(args.checkout)
     loader_bytes(args.loader, args.loader_sha256)

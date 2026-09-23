@@ -110,7 +110,7 @@ def enroll(args, *, session=read_session, android=android_identity):
     require(not destination.exists() and not destination.is_symlink()
             and not destination.resolve().is_relative_to(REPO), 'Use a new private enrollment directory outside Git')
     ports = tuple(int(v) for v in args.ports.split('.'))
-    require(args.bus > 0 and ports and all(v > 0 for v in ports), 'Invalid USB topology')
+    require(args.bus >= 0 and ports and all(v > 0 for v in ports), 'Invalid USB topology')
     require(0 < args.timeout <= 600, 'Invalid enrollment timeout')
     files, offsets = official_inputs(args.official_inputs)
     source_pin(args.checkout)

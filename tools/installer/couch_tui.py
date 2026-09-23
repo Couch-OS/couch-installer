@@ -162,7 +162,9 @@ class PrivateAdapter:
         for key in self.FLAGS:
             core.require(type(value.get(key, False)) is bool, f"{key} must be true or false")
             value.setdefault(key, False)
-        core.require(type(value['bus']) is int and value['bus'] > 0, "bus must be a positive integer")
+        # Bus 0 is a real bus: libusb takes macOS bus numbers from the location
+        # ID, so a remote on the first controller enumerates as bus 0.
+        core.require(type(value['bus']) is int and value['bus'] >= 0, "bus must be a bus number")
         core.require(type(value.get('timeout',120)) in (int,float), "timeout must be numeric")
         for key in ('loader_sha256','preloader_sha256','confirm_cid_sha256','ports'):
             core.require(isinstance(value[key], str), f"{key} must be text")

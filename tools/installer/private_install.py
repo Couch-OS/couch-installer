@@ -25,7 +25,7 @@ def validate_inputs(args):
     cid_hash = hashlib.sha256(bytes.fromhex(baseline["cid"])).hexdigest()
     require(args.confirm_cid_sha256 == cid_hash, "Explicit target CID confirmation mismatch")
     ports = tuple(int(part) for part in args.ports.split("."))
-    require(args.bus > 0 and ports and all(part > 0 for part in ports), "Invalid physical USB port")
+    require(args.bus >= 0 and ports and all(part > 0 for part in ports), "Invalid physical USB port")
     require(0 < args.timeout <= 600, "Timeout must be between 1 and 600 seconds")
     source_pin(args.checkout)
     loader_bytes(args.loader, args.loader_sha256)

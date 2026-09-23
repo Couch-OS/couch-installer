@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from couch_install import InstallError, IDENTITY_PARTITIONS
 from couch_serial import FLAG_CLEAR_SHA256, Unavailable, open_couch_port
 from mtk_adapter import Adapter, Wire, serve, MAX, REVIEWED_SOURCES, couch_query_port, failure_diagnostic
-from mtk_usb import ExactUsbBackend, PacketBufferedInput, bounded_operation, supervised_operations
+from mtk_usb import Candidate, ExactUsbBackend, PacketBufferedInput, bounded_operation, supervised_operations
 from mtk_writer import _open_image, _fd_stamp, _read_at, ConnectedMtkWriter
 
 
@@ -217,6 +217,14 @@ raise SystemExit(serve_stdio(Fixture))
         self.assertEqual(wire.events[-1], {'event': 'android_bound', 'bus': 5, 'ports': [4, 1],
                                            'serial_sha256': hashlib.sha256(b'0127A260301T0463').hexdigest()})
 
+    def test_android_bind_accepts_a_remote_on_bus_zero(self):
+        # macOS numbers the first controller's bus 0; a falsy bus is still a bus.
+        readable = SimpleNamespace(bus=0, port_numbers=(4, 1), serial_number='0127A260301T0463')
+        adapter, wire = self.bind_adapter([readable])
+        adapter.dispatch({'op': 'android_bind', 'serial': '0127A260301T0463'})
+        self.assertEqual(wire.events[-1], {'event': 'android_bound', 'bus': 0, 'ports': [4, 1],
+                                           'serial_sha256': hashlib.sha256(b'0127A260301T0463').hexdigest()})
+
     def test_android_bind_names_unreadable_descriptors_when_the_remote_is_held(self):
         class Unreadable:
             bus, port_numbers = 5, (13,)
@@ -294,7 +302,8 @@ raise SystemExit(serve_stdio(Fixture))
 
     def test_couch_identify_rejects_non_couch_candidate(self):
         for candidate in ({**self.COUCH_PORT, 'pid': 0x2000}, {**self.COUCH_PORT, 'extra': 1},
-                          {**self.COUCH_PORT, 'ports': []}, {**self.COUCH_PORT, 'bus': 0}):
+                          {**self.COUCH_PORT, 'ports': []}, {**self.COUCH_PORT, 'bus': -1},
+                          {**self.COUCH_PORT, 'bus': '0'}):
             adapter, wire = self.bind_adapter([])
             def forbidden(*args, **kwargs):
                 self.fail('Couch serial opened for an invalid port')
@@ -305,6 +314,32 @@ raise SystemExit(serve_stdio(Fixture))
         adapter, _ = self.bind_adapter([])
         with self.assertRaises(InstallError):
             adapter.dispatch({'op': 'couch_identify', 'candidate': self.COUCH_PORT, 'cid': 'ab'*16})
+
+    def test_bus_zero_is_a_real_port_for_every_couch_operation(self):
+        """macOS reports a remote on the first controller as bus 0.
+
+        Refusing it stopped the installer with an unexplained worker failure
+        before it could ask the remote anything.
+        """
+        port = {**self.COUCH_PORT, 'bus': 0}
+        adapter, wire = self.bind_adapter([])
+        opened, closed = [], []
+        answers = [('ab'*16, FLAG_CLEAR_SHA256, 200)] * 2
+        with patch('mtk_adapter.CouchSerial', self.couch_serial(answers, opened, closed)), \
+                patch('mtk_adapter.couch_query_port', return_value=None):
+            adapter.dispatch({'op': 'couch_identify', 'candidate': port})
+            adapter.dispatch({'op': 'couch_reboot', 'candidate': port, 'cid': 'ab'*16})
+        self.assertEqual(wire.events[-1], {'event': 'couch_reboot', 'result': 'requested'})
+        self.assertEqual(opened[0][0].bus, 0)
+        self.assertEqual(opened[0][0].ports, (4, 1))
+        self.assertEqual(len(closed), 2)
+        # The same topology is accepted for the download-agent session: it is
+        # refused later, on the claimed device, not as an invalid topology.
+        adapter, _ = self.bind_adapter([])
+        adapter.backend.claim = lambda selected: None
+        adapter.backend.claimed_candidate = lambda: Candidate(0, 10, (4, 1), 0x0e8d, 0x2000)
+        with self.assertRaisesRegex(InstallError, 'Claimed USB selection differs'):
+            adapter.dispatch({'op': 'start', 'candidate': {**port, 'pid': 0x2000}})
 
     def clearing_serial(self, outcomes, opened):
         class FakeSerial:

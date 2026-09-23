@@ -97,7 +97,7 @@ def validate(args):
     require(args.confirm_cid_sha256 == hashlib.sha256(bytes.fromhex(baseline["cid"])).hexdigest(),
             "Explicit CID confirmation mismatch")
     ports = tuple(int(part) for part in args.ports.split("."))
-    require(args.bus > 0 and ports and all(part > 0 for part in ports), "Invalid physical USB port")
+    require(args.bus >= 0 and ports and all(part > 0 for part in ports), "Invalid physical USB port")
     require(0 < args.timeout <= 600, "Timeout must be between 1 and 600 seconds")
     journal_dir = args.journal_dir.absolute()
     require(not journal_dir.is_symlink() and not journal_dir.exists(),
